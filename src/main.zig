@@ -1,9 +1,10 @@
 const std = @import("std");
 const net = std.net;
 const posix = std.posix;
+const linux = std.os.linux;
 
 pub fn main() !void {
-    const address = try net.Address.resolveIp("127.0.0.1", 6379);
+    const address = try net.Address.resolveIp("0.0.0.0", 6379);
 
     const socket_type = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
     const protocol = posix.IPPROTO.TCP;
@@ -15,29 +16,58 @@ pub fn main() !void {
     try posix.listen(listener, 128);
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("Server listening on 127.0.0.1:6379\n", .{});
+    try stdout.print("Server listening on 0.0.0.0:6379\n", .{});
 
-    const kfd = try posix.kqueue();
-    defer posix.close(kfd);
+    const efd = try posix.epoll_create1(0);
+    defer posix.close(efd);
 
-    // while (true) {
-    // const stream = std.net.Stream{ .handle = socket };
-    // var buffer: [1024]u8 = undefined;
-    // const read = stream.read(&buffer) catch {
-    //     // std.debug.print("error read: {}\n", .{err});
-    //     continue;
-    // };
-    // if (read == 0) {
-    //     continue;
-    // }
-    // std.debug.print("Yo", .{});
-    // try stream.writeAll("+PONG\r\n");
-    // //     const connection = try listener.accept();
-    // //     defer connection.stream.close();
-    // //
-    // //     var buffer: [1024]u8 = undefined;
-    // //     while (try connection.stream.reader().read(&buffer) > 0) {
-    // //         try connection.stream.writeAll("+PONG\r\n");
-    // //     }
-    // }
+    {
+        var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .fd = listener } };
+        try posix.epoll_ctl(efd, linux.EPOLL.CTL_ADD, listener, &event);
+    }
+
+    var ready_list: [128]linux.epoll_event = undefined;
+    while (true) {
+        const ready_count = posix.epoll_wait(efd, &ready_list, -1);
+
+        for (ready_list[0..ready_count]) |ready| {
+            const ready_socket = ready.data.fd;
+
+            if (ready_socket == listener) {
+                const client_socket = try posix.accept(listener, null, null, posix.SOCK.NONBLOCK);
+                errdefer posix.close(client_socket);
+                var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .fd = client_socket } };
+                try posix.epoll_ctl(efd, linux.EPOLL.CTL_ADD, client_socket, &event);
+            } else {
+                var closed = false;
+
+                var client_file = std.fs.File{ .handle = ready_socket };
+                var buf_reader = std.io.bufferedReader(client_file.reader());
+                const reader = buf_reader.reader();
+
+                while (true) {
+                    var buffer: [1024]u8 = undefined;
+                    const line = reader.readUntilDelimiter(&buffer, '\n') catch |err| {
+                        if (err == error.WouldBlock) {
+                            break;
+                        }
+                        if (err == error.EndOfStream) {
+                            closed = true;
+                            break;
+                        }
+                        return err;
+                    };
+
+                    const trimmed_line = std.mem.trim(u8, line, "\r");
+                    if (std.mem.eql(u8, trimmed_line, "PING")) {
+                        _ = try posix.write(ready_socket, "+PONG\r\n");
+                    }
+                }
+
+                if (closed or ready.events & linux.EPOLL.RDHUP == linux.EPOLL.RDHUP) {
+                    posix.close(ready_socket);
+                }
+            }
+        }
+    }
 }
