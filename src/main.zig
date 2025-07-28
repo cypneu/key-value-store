@@ -3,6 +3,8 @@ const net = std.net;
 const posix = std.posix;
 const linux = std.os.linux;
 
+const resp = @import("resp.zig");
+
 pub fn main() !void {
     const address = try net.Address.resolveIp("0.0.0.0", 6379);
 
@@ -45,22 +47,22 @@ pub fn main() !void {
                 var buf_reader = std.io.bufferedReader(client_file.reader());
                 const reader = buf_reader.reader();
 
-                while (true) {
-                    var buffer: [1024]u8 = undefined;
-                    const line = reader.readUntilDelimiter(&buffer, '\n') catch |err| {
-                        if (err == error.WouldBlock) {
-                            break;
-                        }
-                        if (err == error.EndOfStream) {
-                            closed = true;
-                            break;
-                        }
-                        return err;
-                    };
+                var buffer: [1024]u8 = undefined;
+                const read = reader.read(&buffer) catch 0;
 
-                    const trimmed_line = std.mem.trim(u8, line, "\r");
-                    if (std.mem.eql(u8, trimmed_line, "PING")) {
-                        _ = try posix.write(ready_socket, "+PONG\r\n");
+                if (read == 0) {
+                    closed = true;
+                } else {
+                    const input_array = try resp.RESP.parse(&buffer);
+                    if (input_array[0]) |command| {
+                        if (std.ascii.eqlIgnoreCase(command, "PING")) {
+                            _ = try posix.write(ready_socket, "+PONG\r\n");
+                        } else if (std.ascii.eqlIgnoreCase(command, "ECHO")) {
+                            if (input_array[1]) |content| {
+                                var writer = client_file.writer();
+                                _ = try writer.print("${d}\r\n{s}\r\n", .{ content.len, content });
+                            }
+                        }
                     }
                 }
 
