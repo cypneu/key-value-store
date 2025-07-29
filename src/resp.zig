@@ -12,10 +12,16 @@ pub const RESP = struct {
         MissingCLRF,
     };
 
-    pub fn parse(input: []const u8) Error!Array {
+    pub fn parse(input: []const u8) Error![64]?Array {
         var stream = std.io.fixedBufferStream(input);
         var reader = stream.reader();
-        return try parseArray(&reader);
+        var commands_array: [64]?Array = .{null} ** 64;
+
+        for (&commands_array) |*slot| {
+            const array = parseArray(&reader) catch break;
+            slot.* = array;
+        }
+        return commands_array;
     }
 
     fn parseArray(reader: *Reader) Error!Array {

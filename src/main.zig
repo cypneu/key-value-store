@@ -28,6 +28,13 @@ pub fn main() !void {
         try posix.epoll_ctl(efd, linux.EPOLL.CTL_ADD, listener, &event);
     }
 
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var map = std.StringHashMap([]const u8).init(allocator);
+    defer map.deinit();
+
     var ready_list: [128]linux.epoll_event = undefined;
     while (true) {
         const ready_count = posix.epoll_wait(efd, &ready_list, -1);
@@ -41,33 +48,52 @@ pub fn main() !void {
                 var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .fd = client_socket } };
                 try posix.epoll_ctl(efd, linux.EPOLL.CTL_ADD, client_socket, &event);
             } else {
-                var closed = false;
-
                 var client_file = std.fs.File{ .handle = ready_socket };
                 var buf_reader = std.io.bufferedReader(client_file.reader());
                 const reader = buf_reader.reader();
+                const writer = client_file.writer();
 
                 var buffer: [1024]u8 = undefined;
                 const read = reader.read(&buffer) catch 0;
+                if (read == 0 or ready.events & linux.EPOLL.RDHUP == linux.EPOLL.RDHUP) {
+                    posix.close(ready_socket);
+                    continue;
+                }
 
-                if (read == 0) {
-                    closed = true;
-                } else {
-                    const input_array = try resp.RESP.parse(&buffer);
-                    if (input_array[0]) |command| {
+                const commands_array = try resp.RESP.parse(&buffer);
+                for (commands_array) |command_array_optional| {
+                    const actual_command_array = command_array_optional orelse continue;
+
+                    if (actual_command_array[0]) |command| {
                         if (std.ascii.eqlIgnoreCase(command, "PING")) {
                             _ = try posix.write(ready_socket, "+PONG\r\n");
                         } else if (std.ascii.eqlIgnoreCase(command, "ECHO")) {
-                            if (input_array[1]) |content| {
-                                var writer = client_file.writer();
+                            if (actual_command_array[1]) |content| {
                                 _ = try writer.print("${d}\r\n{s}\r\n", .{ content.len, content });
+                            }
+                        } else if (std.ascii.eqlIgnoreCase(command, "SET")) {
+                            if (actual_command_array[1]) |key| {
+                                if (actual_command_array[2]) |value| {
+                                    const owned_value = try allocator.dupe(u8, value);
+                                    errdefer allocator.free(owned_value);
+
+                                    if (try map.fetchPut(key, owned_value)) |kv| {
+                                        allocator.free(kv.value);
+                                    }
+
+                                    _ = try posix.write(ready_socket, "+OK\r\n");
+                                }
+                            }
+                        } else if (std.ascii.eqlIgnoreCase(command, "GET")) {
+                            if (actual_command_array[1]) |key| {
+                                if (map.get(key)) |value| {
+                                    _ = try writer.print("${d}\r\n{s}\r\n", .{ value.len, value });
+                                } else {
+                                    _ = try posix.write(ready_socket, "$-1\r\n");
+                                }
                             }
                         }
                     }
-                }
-
-                if (closed or ready.events & linux.EPOLL.RDHUP == linux.EPOLL.RDHUP) {
-                    posix.close(ready_socket);
                 }
             }
         }
