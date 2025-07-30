@@ -75,7 +75,3 @@ pub const RESP = struct {
         if (lf != '\n') return Error.MissingCLRF;
     }
 };
-
-test "parse PING command" {}
-
-test "parse ECHO command" {}

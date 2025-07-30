@@ -1,9 +1,46 @@
 const std = @import("std");
-const net = std.net;
 const posix = std.posix;
-const linux = std.os.linux;
 
+const server = @import("server.zig");
+const key_value_store = @import("key_value_store.zig");
 const resp = @import("resp.zig");
+
+const logger = @import("log.zig");
+pub const std_options: std.Options = .{
+    .log_level = .info,
+    .logFn = logger.logFn,
+};
+
+const log = std.log.scoped(.app);
+const Store = key_value_store.KeyValueStore;
+const Writer = std.fs.File.Writer;
+
+const Command = enum {
+    PING,
+    ECHO,
+    SET,
+    GET,
+
+    pub fn fromSlice(slice: []const u8) ?Command {
+        if (std.ascii.eqlIgnoreCase(slice, "PING")) return .PING;
+        if (std.ascii.eqlIgnoreCase(slice, "ECHO")) return .ECHO;
+        if (std.ascii.eqlIgnoreCase(slice, "SET")) return .SET;
+        if (std.ascii.eqlIgnoreCase(slice, "GET")) return .GET;
+        return null;
+    }
+};
+
+fn sendNullString(writer: std.fs.File.Writer) !void {
+    try writer.writeAll("$-1\r\n");
+}
+
+fn sendBulkString(writer: std.fs.File.Writer, string: []const u8) !void {
+    try writer.print("${d}\r\n{s}\r\n", .{ string.len, string });
+}
+
+fn sendSimpleString(writer: std.fs.File.Writer, string: []const u8) !void {
+    try writer.print("+{s}\r\n", .{string});
+}
 
 fn calculateExpiration(ttl_ms: u64) i64 {
     const current_micros = std.time.microTimestamp();
@@ -11,157 +48,87 @@ fn calculateExpiration(ttl_ms: u64) i64 {
     return current_micros + ttl_us;
 }
 
-fn isExpired(expiration_us: i64) bool {
-    return std.time.microTimestamp() >= expiration_us;
+fn handlePing(writer: Writer) !void {
+    try sendSimpleString(writer, "PONG");
 }
 
-const Value = struct {
-    data: []const u8,
-    expiration_us: ?i64,
+fn handleEcho(writer: Writer, args: [64]?[]const u8) !void {
+    const content = args[1] orelse return;
+    try sendBulkString(writer, content);
+}
+
+fn handleGet(store: *Store, writer: Writer, args: [64]?[]const u8) !void {
+    const key = args[1] orelse return;
+
+    if (store.get(key)) |value_data| {
+        try sendBulkString(writer, value_data);
+    } else {
+        try sendNullString(writer);
+    }
+}
+
+fn handleSet(store: *Store, writer: Writer, args: [64]?[]const u8) !void {
+    const key = args[1] orelse return;
+    const value_slice = args[2] orelse return;
+    const px_command = args[3] orelse "";
+
+    var expiration_us: ?i64 = null;
+    if (std.ascii.eqlIgnoreCase(px_command, "PX")) {
+        const px_value_slice = args[4] orelse return;
+        const px_value_ms = std.fmt.parseInt(u64, px_value_slice, 10) catch return;
+        expiration_us = calculateExpiration(px_value_ms);
+    }
+
+    try store.set(key, value_slice, expiration_us);
+    try sendSimpleString(writer, "OK");
+}
+
+fn processRequest(store: *Store, writer: Writer, request_data: []const u8) !void {
+    const commands = try resp.RESP.parse(request_data);
+
+    for (commands) |command_parts_optional| {
+        const command_parts = command_parts_optional orelse continue;
+        if (command_parts.len == 0) continue;
+
+        const command_str = command_parts[0] orelse continue;
+        const command = Command.fromSlice(command_str) orelse continue;
+
+        switch (command) {
+            .PING => try handlePing(writer),
+            .ECHO => try handleEcho(writer, command_parts),
+            .GET => try handleGet(store, writer, command_parts),
+            .SET => try handleSet(store, writer, command_parts),
+        }
+    }
+}
+
+const AppHandler = struct {
+    store: *Store,
+
+    pub fn init(store: *Store) AppHandler {
+        return .{ .store = store };
+    }
+
+    pub fn handleRequest(self: *AppHandler, client_fd: posix.fd_t, request_data: []const u8) !void {
+        var client_file = std.fs.File{ .handle = client_fd };
+        try processRequest(self.store, client_file.writer(), request_data);
+    }
 };
 
-fn sendNotFound(writer: anytype) !void {
-    _ = try writer.write("$-1\r\n");
-}
-
-fn sendValue(writer: anytype, v: Value) !void {
-    try writer.print("${d}\r\n{s}\r\n", .{ v.data.len, v.data });
-}
-
 pub fn main() !void {
-    var sigmask = posix.empty_sigset;
-    linux.sigaddset(&sigmask, posix.SIG.INT);
-    linux.sigaddset(&sigmask, posix.SIG.TERM);
-    posix.sigprocmask(posix.SIG.BLOCK, &sigmask, null);
-
-    const quit_fd = try posix.signalfd(-1, &sigmask, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK);
-    defer posix.close(quit_fd);
-
-    const address = try net.Address.resolveIp("0.0.0.0", 6379);
-
-    const socket_type = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
-    const protocol = posix.IPPROTO.TCP;
-    const listener = try posix.socket(address.any.family, socket_type, protocol);
-    defer posix.close(listener);
-
-    try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-    try posix.bind(listener, &address.any, address.getOsSockLen());
-    try posix.listen(listener, 128);
-
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print("Server listening on 0.0.0.0:6379\n", .{});
-
-    const efd = try posix.epoll_create1(0);
-    defer posix.close(efd);
-
-    {
-        var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .fd = listener } };
-        try posix.epoll_ctl(efd, linux.EPOLL.CTL_ADD, listener, &event);
-    }
-    {
-        var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .fd = quit_fd } };
-        try posix.epoll_ctl(efd, linux.EPOLL.CTL_ADD, quit_fd, &event);
-    }
+    log.info("Initializing server...", .{});
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var map = std.StringHashMap(Value).init(allocator);
-    defer {
-        {
-            var it = map.iterator();
-            while (it.next()) |e| allocator.free(e.value_ptr.data);
-        }
-        map.deinit();
-    }
+    var store = Store.init(allocator);
+    defer store.deinit();
 
-    var ready_list: [128]linux.epoll_event = undefined;
-    main_loop: while (true) {
-        const ready_count = posix.epoll_wait(efd, &ready_list, -1);
+    const app_handler = AppHandler.init(&store);
 
-        for (ready_list[0..ready_count]) |ready| {
-            const ready_socket = ready.data.fd;
-            if (ready_socket == quit_fd) {
-                std.debug.print("\nSignal received, shutting down gracefully.\n", .{});
-                break :main_loop;
-            }
+    var server_instance = try server.Server(AppHandler).init(app_handler, "0.0.0.0", 6379);
+    defer server_instance.deinit();
 
-            if (ready_socket == listener) {
-                const client_socket = try posix.accept(listener, null, null, posix.SOCK.NONBLOCK);
-                errdefer posix.close(client_socket);
-                var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .fd = client_socket } };
-                try posix.epoll_ctl(efd, linux.EPOLL.CTL_ADD, client_socket, &event);
-            } else {
-                var client_file = std.fs.File{ .handle = ready_socket };
-                var buf_reader = std.io.bufferedReader(client_file.reader());
-                const reader = buf_reader.reader();
-                const writer = client_file.writer();
-
-                var buffer: [1024]u8 = undefined;
-                const read = reader.read(&buffer) catch 0;
-                if (read == 0 or ready.events & linux.EPOLL.RDHUP == linux.EPOLL.RDHUP) {
-                    posix.close(ready_socket);
-                    continue;
-                }
-
-                const commands_array = try resp.RESP.parse(&buffer);
-                for (commands_array) |command_array_optional| {
-                    const actual_command_array = command_array_optional orelse continue;
-
-                    if (actual_command_array[0]) |command| {
-                        if (std.ascii.eqlIgnoreCase(command, "PING")) {
-                            _ = try posix.write(ready_socket, "+PONG\r\n");
-                        } else if (std.ascii.eqlIgnoreCase(command, "ECHO")) {
-                            if (actual_command_array[1]) |content| {
-                                _ = try writer.print("${d}\r\n{s}\r\n", .{ content.len, content });
-                            }
-                        } else if (std.ascii.eqlIgnoreCase(command, "SET")) {
-                            if (actual_command_array[1]) |key| {
-                                if (actual_command_array[2]) |value_slice| {
-                                    const owned_value = try allocator.dupe(u8, value_slice);
-                                    errdefer allocator.free(owned_value);
-
-                                    var value = Value{ .data = owned_value, .expiration_us = null };
-
-                                    if (actual_command_array[3]) |px| {
-                                        if (std.ascii.eqlIgnoreCase(px, "PX")) {
-                                            if (actual_command_array[4]) |px_value_slice| {
-                                                if (std.fmt.parseInt(u64, px_value_slice, 10)) |px_value_ms| {
-                                                    value.expiration_us = calculateExpiration(px_value_ms);
-                                                } else |err| {
-                                                    std.debug.print("Error: {}\n", .{err});
-                                                    continue;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if (try map.fetchPut(key, value)) |kv| {
-                                        allocator.free(kv.value.data);
-                                    }
-
-                                    _ = try posix.write(ready_socket, "+OK\r\n");
-                                }
-                            }
-                        } else if (std.ascii.eqlIgnoreCase(command, "GET")) {
-                            const key = actual_command_array[1] orelse continue;
-                            const value = map.get(key) orelse {
-                                try sendNotFound(writer);
-                                continue;
-                            };
-                            const is_key_expired = if (value.expiration_us) |exp| isExpired(exp) else false;
-
-                            if (is_key_expired) {
-                                if (map.fetchRemove(key)) |removed| {
-                                    allocator.free(removed.value.data);
-                                }
-                                try sendNotFound(writer);
-                            } else try sendValue(writer, value);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    try server_instance.run();
 }
