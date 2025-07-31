@@ -1,8 +1,8 @@
 const std = @import("std");
-const posix = std.posix;
 
 const server = @import("server.zig");
-const key_value_store = @import("key_value_store.zig");
+const key_value_store = @import("data_structures/key_value_store.zig");
+const lists = @import("data_structures/lists.zig");
 const resp = @import("resp.zig");
 
 const logger = @import("log.zig");
@@ -11,8 +11,11 @@ pub const std_options: std.Options = .{
     .logFn = logger.logFn,
 };
 
+const posix = std.posix;
 const log = std.log.scoped(.app);
+
 const Store = key_value_store.KeyValueStore;
+const Lists = lists.Lists;
 const Writer = std.fs.File.Writer;
 
 const Command = enum {
@@ -20,12 +23,14 @@ const Command = enum {
     ECHO,
     SET,
     GET,
+    RPUSH,
 
     pub fn fromSlice(slice: []const u8) ?Command {
         if (std.ascii.eqlIgnoreCase(slice, "PING")) return .PING;
         if (std.ascii.eqlIgnoreCase(slice, "ECHO")) return .ECHO;
         if (std.ascii.eqlIgnoreCase(slice, "SET")) return .SET;
         if (std.ascii.eqlIgnoreCase(slice, "GET")) return .GET;
+        if (std.ascii.eqlIgnoreCase(slice, "RPUSH")) return .RPUSH;
         return null;
     }
 };
@@ -40,6 +45,10 @@ fn sendBulkString(writer: std.fs.File.Writer, string: []const u8) !void {
 
 fn sendSimpleString(writer: std.fs.File.Writer, string: []const u8) !void {
     try writer.print("+{s}\r\n", .{string});
+}
+
+fn sendInteger(writer: std.fs.File.Writer, value: u64) !void {
+    try writer.print(":{}\r\n", .{value});
 }
 
 fn calculateExpiration(ttl_ms: u64) i64 {
@@ -83,7 +92,15 @@ fn handleSet(store: *Store, writer: Writer, args: [64]?[]const u8) !void {
     try sendSimpleString(writer, "OK");
 }
 
-fn processRequest(store: *Store, writer: Writer, request_data: []const u8) !void {
+fn handleRpush(lists_store: *Lists, writer: Writer, args: [64]?[]const u8) !void {
+    const key = args[1] orelse return;
+    const value_slice = args[2] orelse return;
+
+    const length = try lists_store.append(key, value_slice);
+    try sendInteger(writer, length);
+}
+
+fn processRequest(handler: *AppHandler, writer: Writer, request_data: []const u8) !void {
     const commands = try resp.RESP.parse(request_data);
 
     for (commands) |command_parts_optional| {
@@ -96,22 +113,24 @@ fn processRequest(store: *Store, writer: Writer, request_data: []const u8) !void
         switch (command) {
             .PING => try handlePing(writer),
             .ECHO => try handleEcho(writer, command_parts),
-            .GET => try handleGet(store, writer, command_parts),
-            .SET => try handleSet(store, writer, command_parts),
+            .GET => try handleGet(handler.store, writer, command_parts),
+            .SET => try handleSet(handler.store, writer, command_parts),
+            .RPUSH => try handleRpush(handler.lists, writer, command_parts),
         }
     }
 }
 
 const AppHandler = struct {
     store: *Store,
+    lists: *Lists,
 
-    pub fn init(store: *Store) AppHandler {
-        return .{ .store = store };
+    pub fn init(store: *Store, lists_store: *Lists) AppHandler {
+        return .{ .store = store, .lists = lists_store };
     }
 
     pub fn handleRequest(self: *AppHandler, client_fd: posix.fd_t, request_data: []const u8) !void {
         var client_file = std.fs.File{ .handle = client_fd };
-        try processRequest(self.store, client_file.writer(), request_data);
+        try processRequest(self, client_file.writer(), request_data);
     }
 };
 
@@ -125,7 +144,10 @@ pub fn main() !void {
     var store = Store.init(allocator);
     defer store.deinit();
 
-    const app_handler = AppHandler.init(&store);
+    var lists_store = Lists.init(allocator);
+    defer lists_store.deinit();
+
+    const app_handler = AppHandler.init(&store, &lists_store);
 
     var server_instance = try server.Server(AppHandler).init(app_handler, "0.0.0.0", 6379);
     defer server_instance.deinit();
