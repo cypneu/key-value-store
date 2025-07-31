@@ -94,9 +94,13 @@ fn handleSet(store: *Store, writer: Writer, args: [64]?[]const u8) !void {
 
 fn handleRpush(lists_store: *Lists, writer: Writer, args: [64]?[]const u8) !void {
     const key = args[1] orelse return;
-    const value_slice = args[2] orelse return;
 
-    const length = try lists_store.append(key, value_slice);
+    var length: u64 = 0;
+    for (args[2..]) |value_opt| {
+        const value = value_opt orelse break;
+        length = try lists_store.append(key, value);
+    }
+
     try sendInteger(writer, length);
 }
 
