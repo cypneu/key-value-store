@@ -25,6 +25,7 @@ const Command = enum {
     GET,
     RPUSH,
     LRANGE,
+    LPUSH,
 
     pub fn fromSlice(slice: []const u8) ?Command {
         if (std.ascii.eqlIgnoreCase(slice, "PING")) return .PING;
@@ -33,6 +34,7 @@ const Command = enum {
         if (std.ascii.eqlIgnoreCase(slice, "GET")) return .GET;
         if (std.ascii.eqlIgnoreCase(slice, "RPUSH")) return .RPUSH;
         if (std.ascii.eqlIgnoreCase(slice, "LRANGE")) return .LRANGE;
+        if (std.ascii.eqlIgnoreCase(slice, "LPUSH")) return .LPUSH;
         return null;
     }
 };
@@ -68,6 +70,23 @@ fn formatStringArray(allocator: std.mem.Allocator, strings: []const []const u8) 
     }
 
     return buffer.toOwnedSlice();
+}
+
+fn formatStringArrayRange(
+    allocator: std.mem.Allocator,
+    view: lists.RangeView([]const u8),
+) ![]const u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+
+    const writer = buf.writer();
+    const total = view.first.len + view.second.len;
+
+    try writer.print("*{d}\r\n", .{total});
+    for (view.first) |s| try writer.print("${d}\r\n{s}\r\n", .{ s.len, s });
+    for (view.second) |s| try writer.print("${d}\r\n{s}\r\n", .{ s.len, s });
+
+    return buf.toOwnedSlice();
 }
 
 fn formatError(allocator: std.mem.Allocator, message: []const u8) ![]const u8 {
@@ -123,6 +142,18 @@ fn handleRpush(allocator: std.mem.Allocator, lists_store: *Lists, args: [64]?[]c
     return formatInteger(allocator, length);
 }
 
+fn handleLpush(allocator: std.mem.Allocator, lists_store: *Lists, args: [64]?[]const u8) ![]const u8 {
+    const key = args[1] orelse return formatError(allocator, ERR_ARG_NUM);
+
+    var length: u64 = 0;
+    for (args[2..]) |value_opt| {
+        const value = value_opt orelse break;
+        length = try lists_store.prepend(key, value);
+    }
+
+    return formatInteger(allocator, length);
+}
+
 fn handleLrange(allocator: std.mem.Allocator, lists_store: *Lists, args: [64]?[]const u8) ![]const u8 {
     const key = args[1] orelse return formatError(allocator, ERR_ARG_NUM);
     const start_index_slice = args[2] orelse return formatError(allocator, ERR_ARG_NUM);
@@ -131,8 +162,8 @@ fn handleLrange(allocator: std.mem.Allocator, lists_store: *Lists, args: [64]?[]
     const start_index = std.fmt.parseInt(i64, start_index_slice, 10) catch return formatError(allocator, ERR_NOT_INTEGER);
     const end_index = std.fmt.parseInt(i64, end_index_slice, 10) catch return formatError(allocator, ERR_NOT_INTEGER);
 
-    const range = lists_store.lrange(key, start_index, end_index);
-    return formatStringArray(allocator, range);
+    const range_view = lists_store.lrange(key, start_index, end_index);
+    return formatStringArrayRange(allocator, range_view);
 }
 
 fn processRequest(handler: *AppHandler, request_allocator: std.mem.Allocator, request_data: []const u8) ![]const u8 {
@@ -154,6 +185,7 @@ fn processRequest(handler: *AppHandler, request_allocator: std.mem.Allocator, re
             .SET => handleSet(request_allocator, handler.store, command_parts),
             .RPUSH => handleRpush(request_allocator, handler.lists, command_parts),
             .LRANGE => handleLrange(request_allocator, handler.lists, command_parts),
+            .LPUSH => handleLpush(request_allocator, handler.lists, command_parts),
         };
 
         try response_buffer.writer().writeAll(response);

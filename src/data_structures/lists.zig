@@ -2,12 +2,12 @@ const std = @import("std");
 
 pub const Lists = struct {
     allocator: std.mem.Allocator,
-    data: std.StringHashMap(std.ArrayList([]const u8)),
+    data: std.StringHashMap(Deque([]const u8)),
 
     pub fn init(allocator: std.mem.Allocator) Lists {
         return Lists{
             .allocator = allocator,
-            .data = std.StringHashMap(std.ArrayList([]const u8)).init(allocator),
+            .data = std.StringHashMap(Deque([]const u8)).init(allocator),
         };
     }
 
@@ -15,34 +15,44 @@ pub const Lists = struct {
         var it = self.data.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            for (entry.value_ptr.items) |item_slice| {
-                self.allocator.free(item_slice);
-            }
-            entry.value_ptr.deinit();
+            defer entry.value_ptr.deinit();
         }
         self.data.deinit();
     }
 
     pub fn append(self: *Lists, key: []const u8, value: []const u8) !u64 {
-        const gop = try self.data.getOrPut(key);
+        const owned = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned);
+
+        var gop = try self.data.getOrPut(key);
         if (!gop.found_existing) {
             gop.key_ptr.* = try self.allocator.dupe(u8, key);
-            gop.value_ptr.* = std.ArrayList([]const u8).init(self.allocator);
+            gop.value_ptr.* = try Deque([]const u8).init(self.allocator, 32);
         }
 
-        const owned_value = try self.allocator.dupe(u8, value);
-        errdefer self.allocator.free(owned_value);
-
-        const list = gop.value_ptr;
-        try list.append(owned_value);
-        return list.items.len;
+        try gop.value_ptr.pushBack(owned);
+        return gop.value_ptr.len;
     }
 
-    pub fn lrange(self: *Lists, key: []const u8, start_index: i64, end_index: i64) []const []const u8 {
-        const list = self.data.get(key) orelse return &[_][]const u8{};
+    pub fn prepend(self: *Lists, key: []const u8, value: []const u8) !u64 {
+        const owned = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned);
 
-        const length = @as(i64, @intCast(list.items.len));
-        if (length == 0) return &[_][]const u8{};
+        var gop = try self.data.getOrPut(key);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.allocator.dupe(u8, key);
+            gop.value_ptr.* = try Deque([]const u8).init(self.allocator, 32);
+        }
+
+        try gop.value_ptr.pushFront(owned);
+        return gop.value_ptr.len;
+    }
+
+    pub fn lrange(self: *Lists, key: []const u8, start_index: i64, end_index: i64) RangeView([]const u8) {
+        const deque = self.data.get(key) orelse return .{ .first = &[_][]const u8{}, .second = &[_][]const u8{} };
+
+        const length = @as(i64, @intCast(deque.len));
+        if (length == 0) return .{ .first = &[_][]const u8{}, .second = &[_][]const u8{} };
 
         var start = if (start_index < 0) start_index + length else start_index;
         var end = if (end_index < 0) end_index + length else end_index;
@@ -50,11 +60,109 @@ pub const Lists = struct {
         start = @max(0, start);
         end = @min(length - 1, end);
 
-        if (start > end) return &[_][]const u8{};
+        if (start > end) return .{ .first = &[_][]const u8{}, .second = &[_][]const u8{} };
 
         const first = @as(usize, @intCast(start));
         const last = @as(usize, @intCast(end + 1));
 
-        return list.items[first..last];
+        return deque.range(first, last - first);
     }
 };
+
+pub fn RangeView(comptime T: type) type {
+    return struct {
+        first: []T,
+        second: []T,
+    };
+}
+
+fn Deque(comptime T: type) type {
+    return struct {
+        allocator: std.mem.Allocator,
+        buffer: []T,
+        head: usize = 0,
+        len: usize = 0,
+
+        const Self = @This();
+
+        pub fn init(allocator: std.mem.Allocator, initial_capacity: usize) !Self {
+            const capacity = @max(1, initial_capacity);
+            return Self{
+                .allocator = allocator,
+                .buffer = try allocator.alloc(T, capacity),
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            while (self.popFront()) |value| {
+                self.allocator.free(@constCast(value));
+            }
+            self.allocator.free(self.buffer);
+        }
+
+        pub fn pushBack(self: *Self, value: T) !void {
+            try self.ensureCapacity(1);
+            const idx = (self.head + self.len) % self.buffer.len;
+            self.buffer[idx] = value;
+            self.len += 1;
+        }
+
+        pub fn pushFront(self: *Self, value: T) !void {
+            try self.ensureCapacity(1);
+            self.head = (self.head + self.buffer.len - 1) % self.buffer.len;
+            self.buffer[self.head] = value;
+            self.len += 1;
+        }
+
+        pub fn popFront(self: *Self) ?T {
+            if (self.len == 0) return null;
+            const val = self.buffer[self.head];
+            self.head = (self.head + 1) % self.buffer.len;
+            self.len -= 1;
+            return val;
+        }
+
+        pub fn popBack(self: *Self) ?T {
+            if (self.len == 0) return null;
+            const tail_idx = (self.head + self.len - 1) % self.buffer.len;
+            const val = self.buffer[tail_idx];
+            self.len -= 1;
+            return val;
+        }
+
+        pub fn range(self: *const Self, start: usize, count: usize) RangeView(T) {
+            const first = (self.head + start) % self.buffer.len;
+            const end = (first + count);
+
+            if (end <= self.buffer.len) {
+                return .{
+                    .first = self.buffer[first..end],
+                    .second = self.buffer[0..0],
+                };
+            } else {
+                const first_part = self.buffer[first..];
+                const second_len = count - first_part.len;
+                return .{
+                    .first = first_part,
+                    .second = self.buffer[0..second_len],
+                };
+            }
+        }
+
+        fn ensureCapacity(self: *Self, need_extra: usize) !void {
+            if (self.len + need_extra <= self.buffer.len) return;
+
+            const new_capacity = self.buffer.len * 2;
+            var new_buffer = try self.allocator.alloc(T, new_capacity);
+
+            const first_chunk = self.buffer[self.head..];
+            const second_len = self.len - first_chunk.len;
+            @memcpy(new_buffer[0..first_chunk.len], first_chunk);
+            @memcpy(new_buffer[first_chunk.len..self.len], self.buffer[0..second_len]);
+
+            self.allocator.free(self.buffer);
+            self.buffer = new_buffer;
+            self.head = 0;
+        }
+    };
+}
