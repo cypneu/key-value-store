@@ -10,18 +10,18 @@ const Value = struct {
     }
 };
 
-pub const KeyValueStore = struct {
+pub const StringStore = struct {
     allocator: std.mem.Allocator,
     data: std.StringHashMap(Value),
 
-    pub fn init(allocator: std.mem.Allocator) KeyValueStore {
-        return KeyValueStore{
+    pub fn init(allocator: std.mem.Allocator) StringStore {
+        return StringStore{
             .allocator = allocator,
             .data = std.StringHashMap(Value).init(allocator),
         };
     }
 
-    pub fn deinit(self: *KeyValueStore) void {
+    pub fn deinit(self: *StringStore) void {
         var it = self.data.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.value_ptr.data);
@@ -29,7 +29,7 @@ pub const KeyValueStore = struct {
         self.data.deinit();
     }
 
-    pub fn set(self: *KeyValueStore, key: []const u8, value_slice: []const u8, expiration_us: ?i64) !void {
+    pub fn set(self: *StringStore, key: []const u8, value_slice: []const u8, expiration_us: ?i64) !void {
         const owned_value = try self.allocator.dupe(u8, value_slice);
         errdefer self.allocator.free(owned_value);
 
@@ -43,7 +43,7 @@ pub const KeyValueStore = struct {
         }
     }
 
-    pub fn get(self: *KeyValueStore, key: []const u8) ?[]const u8 {
+    pub fn get(self: *StringStore, key: []const u8) ?[]const u8 {
         const entry = self.data.getEntry(key) orelse return null;
 
         if (entry.value_ptr.isExpired()) {

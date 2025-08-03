@@ -1,17 +1,17 @@
 const std = @import("std");
 
-pub const Lists = struct {
+pub const ListStore = struct {
     allocator: std.mem.Allocator,
     data: std.StringHashMap(Deque([]const u8)),
 
-    pub fn init(allocator: std.mem.Allocator) Lists {
-        return Lists{
+    pub fn init(allocator: std.mem.Allocator) ListStore {
+        return ListStore{
             .allocator = allocator,
             .data = std.StringHashMap(Deque([]const u8)).init(allocator),
         };
     }
 
-    pub fn deinit(self: *Lists) void {
+    pub fn deinit(self: *ListStore) void {
         var it = self.data.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -20,7 +20,15 @@ pub const Lists = struct {
         self.data.deinit();
     }
 
-    pub fn append(self: *Lists, key: []const u8, value: []const u8) !u64 {
+    pub fn prepend(self: *ListStore, key: []const u8, value: []const u8) !u64 {
+        return self.push(key, value, true);
+    }
+
+    pub fn append(self: *ListStore, key: []const u8, value: []const u8) !u64 {
+        return self.push(key, value, false);
+    }
+
+    pub fn push(self: *ListStore, key: []const u8, value: []const u8, comptime front: bool) !u64 {
         const owned = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(owned);
 
@@ -30,25 +38,15 @@ pub const Lists = struct {
             gop.value_ptr.* = try Deque([]const u8).init(self.allocator, 32);
         }
 
-        try gop.value_ptr.pushBack(owned);
+        if (front)
+            try gop.value_ptr.pushFront(owned)
+        else
+            try gop.value_ptr.pushBack(owned);
+
         return gop.value_ptr.len;
     }
 
-    pub fn prepend(self: *Lists, key: []const u8, value: []const u8) !u64 {
-        const owned = try self.allocator.dupe(u8, value);
-        errdefer self.allocator.free(owned);
-
-        var gop = try self.data.getOrPut(key);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try self.allocator.dupe(u8, key);
-            gop.value_ptr.* = try Deque([]const u8).init(self.allocator, 32);
-        }
-
-        try gop.value_ptr.pushFront(owned);
-        return gop.value_ptr.len;
-    }
-
-    pub fn lrange(self: *Lists, key: []const u8, start_index: i64, end_index: i64) RangeView([]const u8) {
+    pub fn lrange(self: *ListStore, key: []const u8, start_index: i64, end_index: i64) RangeView([]const u8) {
         const deque = self.data.get(key) orelse return .{ .first = &[_][]const u8{}, .second = &[_][]const u8{} };
 
         const length = @as(i64, @intCast(deque.len));
@@ -66,6 +64,10 @@ pub const Lists = struct {
         const last = @as(usize, @intCast(end + 1));
 
         return deque.range(first, last - first);
+    }
+
+    pub fn length_by_key(self: *ListStore, key: []const u8) u64 {
+        return if (self.data.get(key)) |value| @as(u64, @intCast(value.len)) else 0;
     }
 };
 
