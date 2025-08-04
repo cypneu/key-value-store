@@ -15,7 +15,7 @@ pub const ListStore = struct {
         var it = self.data.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            defer entry.value_ptr.deinit();
+            entry.value_ptr.deinit();
         }
         self.data.deinit();
     }
@@ -69,6 +69,22 @@ pub const ListStore = struct {
     pub fn length_by_key(self: *ListStore, key: []const u8) u64 {
         return if (self.data.get(key)) |value| @as(u64, @intCast(value.len)) else 0;
     }
+
+    pub fn lpop(self: *ListStore, key: []const u8, out_allocator: std.mem.Allocator) !?[]const u8 {
+        var entry = self.data.getEntry(key) orelse return null;
+        const value = entry.value_ptr.popFront() orelse return null;
+
+        const copy = try out_allocator.dupe(u8, value);
+        self.allocator.free(value);
+
+        if (entry.value_ptr.len == 0) {
+            var removed = self.data.fetchRemove(key).?;
+            self.allocator.free(removed.key);
+            removed.value.deinit();
+        }
+
+        return copy;
+    }
 };
 
 pub fn RangeView(comptime T: type) type {
@@ -97,7 +113,7 @@ fn Deque(comptime T: type) type {
 
         pub fn deinit(self: *Self) void {
             while (self.popFront()) |value| {
-                self.allocator.free(@constCast(value));
+                self.allocator.free(value);
             }
             self.allocator.free(self.buffer);
         }

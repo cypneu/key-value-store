@@ -76,3 +76,9 @@ pub fn handleLlen(allocator: std.mem.Allocator, list_store: *db.ListStore, args:
     const length = list_store.length_by_key(key);
     return format.integer(allocator, length);
 }
+
+pub fn handleLpop(allocator: std.mem.Allocator, list_store: *db.ListStore, args: [64]?[]const u8) ![]const u8 {
+    const key = args[1] orelse return format.simpleError(allocator, format.ERR_ARG_NUM);
+    const value = try list_store.lpop(key, allocator) orelse return format.NULL_BULK_STRING;
+    return format.bulkString(allocator, value);
+}

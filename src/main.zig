@@ -25,6 +25,7 @@ const Command = enum {
     LRANGE,
     LPUSH,
     LLEN,
+    LPOP,
 
     pub fn fromSlice(slice: []const u8) ?Command {
         if (std.ascii.eqlIgnoreCase(slice, "PING")) return .PING;
@@ -35,6 +36,7 @@ const Command = enum {
         if (std.ascii.eqlIgnoreCase(slice, "LRANGE")) return .LRANGE;
         if (std.ascii.eqlIgnoreCase(slice, "LPUSH")) return .LPUSH;
         if (std.ascii.eqlIgnoreCase(slice, "LLEN")) return .LLEN;
+        if (std.ascii.eqlIgnoreCase(slice, "LPOP")) return .LPOP;
         return null;
     }
 };
@@ -60,6 +62,7 @@ fn processRequest(handler: *AppHandler, request_allocator: std.mem.Allocator, re
             .RPUSH => handlers.handleRpush(request_allocator, handler.list_store, command_parts),
             .LRANGE => handlers.handleLrange(request_allocator, handler.list_store, command_parts),
             .LLEN => handlers.handleLlen(request_allocator, handler.list_store, command_parts),
+            .LPOP => handlers.handleLpop(request_allocator, handler.list_store, command_parts),
         };
 
         try response_buffer.writer().writeAll(response);
