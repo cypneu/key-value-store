@@ -70,12 +70,19 @@ pub const ListStore = struct {
         return if (self.data.get(key)) |value| @as(u64, @intCast(value.len)) else 0;
     }
 
-    pub fn lpop(self: *ListStore, key: []const u8, out_allocator: std.mem.Allocator) !?[]const u8 {
-        var entry = self.data.getEntry(key) orelse return null;
-        const value = entry.value_ptr.popFront() orelse return null;
+    pub fn lpop(self: *ListStore, key: []const u8, count: u64, out_allocator: std.mem.Allocator) ![][]const u8 {
+        var entry = self.data.getEntry(key) orelse return &[_][]const u8{};
 
-        const copy = try out_allocator.dupe(u8, value);
-        self.allocator.free(value);
+        const take = @min(count, entry.value_ptr.len);
+        if (take == 0) return &[_][]const u8{};
+
+        const output = try out_allocator.alloc([]const u8, take);
+
+        for (output) |*slot| {
+            const val = entry.value_ptr.popFront().?;
+            slot.* = try out_allocator.dupe(u8, val);
+            self.allocator.free(val);
+        }
 
         if (entry.value_ptr.len == 0) {
             var removed = self.data.fetchRemove(key).?;
@@ -83,7 +90,7 @@ pub const ListStore = struct {
             removed.value.deinit();
         }
 
-        return copy;
+        return output;
     }
 };
 
