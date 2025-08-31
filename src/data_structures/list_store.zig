@@ -84,12 +84,6 @@ pub const ListStore = struct {
             self.allocator.free(val);
         }
 
-        if (entry.value_ptr.len == 0) {
-            var removed = self.data.fetchRemove(key).?;
-            self.allocator.free(removed.key);
-            removed.value.deinit();
-        }
-
         return output;
     }
 };

@@ -1,20 +1,47 @@
 const std = @import("std");
-const format = @import("format.zig");
+const format = @import("resp/format.zig");
 const db = @import("data_structures/mod.zig");
+const ClientConnection = @import("state.zig").ClientConnection;
+const AppHandler = @import("state.zig").AppHandler;
+const Reply = @import("reply.zig").Reply;
+const ErrorKind = @import("reply.zig").ErrorKind;
+const Notify = @import("state.zig").Notify;
 
-pub fn handleEcho(allocator: std.mem.Allocator, args: [64]?[]const u8) ![]const u8 {
-    const content = args[1] orelse return format.NULL_BULK_STRING;
-    return try format.bulkString(allocator, content);
+pub const CommandOutcome = struct {
+    reply: Reply,
+    notify: []Notify,
+};
+
+fn stringArrayReply(allocator: std.mem.Allocator, items: []const []const u8) !Reply {
+    var arr = try allocator.alloc(Reply, items.len);
+    for (items, 0..) |s, i| {
+        arr[i] = Reply{ .BulkString = s };
+    }
+    return Reply{ .Array = arr };
 }
 
-pub fn handleGet(allocator: std.mem.Allocator, string_store: *db.StringStore, args: [64]?[]const u8) ![]const u8 {
-    const key = args[1] orelse return format.simpleError(allocator, format.ERR_ARG_NUM);
+fn stringArrayFromRangeView(allocator: std.mem.Allocator, rv: db.RangeView([]const u8)) !Reply {
+    const total = rv.first.len + rv.second.len;
+    var arr = try allocator.alloc(Reply, total);
 
-    if (string_store.get(key)) |value_data| {
-        return format.bulkString(allocator, value_data);
-    } else {
-        return format.NULL_BULK_STRING;
+    for (rv.first, 0..) |s, i| {
+        arr[i] = Reply{ .BulkString = s };
     }
+    for (rv.second, 0..) |s, i| {
+        arr[i] = Reply{ .BulkString = s };
+    }
+
+    return Reply{ .Array = arr };
+}
+
+pub fn handleEcho(args: [64]?[]const u8) !Reply {
+    const content = args[1] orelse return .{ .BulkString = null };
+    return Reply{ .BulkString = content };
+}
+
+pub fn handleGet(string_store: *db.StringStore, args: [64]?[]const u8) !Reply {
+    const key = args[1] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
+    return Reply{ .BulkString = string_store.get(key) };
 }
 
 fn calculateExpiration(ttl_ms: u64) i64 {
@@ -23,70 +50,109 @@ fn calculateExpiration(ttl_ms: u64) i64 {
     return current_micros + ttl_us;
 }
 
-pub fn handleSet(allocator: std.mem.Allocator, store: *db.StringStore, args: [64]?[]const u8) ![]const u8 {
-    const key = args[1] orelse return format.simpleError(allocator, format.ERR_ARG_NUM);
-    const value_slice = args[2] orelse return format.simpleError(allocator, format.ERR_ARG_NUM);
+pub fn handleSet(store: *db.StringStore, args: [64]?[]const u8) !Reply {
+    const key = args[1] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
+    const value_slice = args[2] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
     const px_command = args[3] orelse "";
 
     var expiration_us: ?i64 = null;
     if (std.ascii.eqlIgnoreCase(px_command, "PX")) {
-        const px_value_slice = args[4] orelse return format.simpleError(allocator, format.ERR_SYNTAX);
-        const px_value_ms = std.fmt.parseInt(u64, px_value_slice, 10) catch return format.simpleError(allocator, format.ERR_NOT_INTEGER);
+        const px_value_slice = args[4] orelse return .{ .Error = .{ .kind = ErrorKind.Syntax } };
+        const px_value_ms = std.fmt.parseInt(u64, px_value_slice, 10) catch return .{ .Error = .{ .kind = ErrorKind.NotInteger } };
         expiration_us = calculateExpiration(px_value_ms);
     }
 
     try store.set(key, value_slice, expiration_us);
-    return format.OK_MESSAGE;
+    return .{ .SimpleString = "OK" };
 }
 
-pub fn handleLpush(alloc: std.mem.Allocator, ls: *db.ListStore, args: [64]?[]const u8) ![]const u8 {
-    return handlePush(true, alloc, ls, args);
+pub fn handleLpush(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !CommandOutcome {
+    return handlePush(true, allocator, handler, args);
 }
 
-pub fn handleRpush(alloc: std.mem.Allocator, ls: *db.ListStore, args: [64]?[]const u8) ![]const u8 {
-    return handlePush(false, alloc, ls, args);
+pub fn handleRpush(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !CommandOutcome {
+    return handlePush(false, allocator, handler, args);
 }
 
-fn handlePush(comptime is_left: bool, allocator: std.mem.Allocator, list_store: *db.ListStore, args: [64]?[]const u8) ![]const u8 {
-    const key = args[1] orelse return format.simpleError(allocator, format.ERR_ARG_NUM);
+fn handlePush(comptime is_left: bool, allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !CommandOutcome {
+    const key = args[1] orelse return .{ .reply = Reply{ .Error = .{ .kind = ErrorKind.ArgNum } }, .notify = &.{} };
 
     var length: u64 = 0;
+    var pushed: usize = 0;
     for (args[2..]) |value_opt| {
         const value = value_opt orelse break;
-        length = try list_store.push(key, value, is_left);
+        length = try handler.list_store.push(key, value, is_left);
+        pushed += 1;
     }
 
-    return format.integer(allocator, length);
+    const notify = try handler.drainWaitersForKey(allocator, key, pushed);
+
+    return .{
+        .reply = Reply{ .Integer = @intCast(length) },
+        .notify = notify,
+    };
 }
 
-pub fn handleLrange(allocator: std.mem.Allocator, list_store: *db.ListStore, args: [64]?[]const u8) ![]const u8 {
-    const key = args[1] orelse return format.simpleError(allocator, format.ERR_ARG_NUM);
-    const start_index_slice = args[2] orelse return format.simpleError(allocator, format.ERR_ARG_NUM);
-    const end_index_slice = args[3] orelse return format.simpleError(allocator, format.ERR_ARG_NUM);
+pub fn handleLrange(allocator: std.mem.Allocator, list_store: *db.ListStore, args: [64]?[]const u8) !Reply {
+    const key = args[1] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
+    const start_index_slice = args[2] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
+    const end_index_slice = args[3] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
 
-    const start_index = std.fmt.parseInt(i64, start_index_slice, 10) catch return format.simpleError(allocator, format.ERR_NOT_INTEGER);
-    const end_index = std.fmt.parseInt(i64, end_index_slice, 10) catch return format.simpleError(allocator, format.ERR_NOT_INTEGER);
+    const start_index = std.fmt.parseInt(i64, start_index_slice, 10) catch return .{ .Error = .{ .kind = ErrorKind.NotInteger } };
+    const end_index = std.fmt.parseInt(i64, end_index_slice, 10) catch return .{ .Error = .{ .kind = ErrorKind.NotInteger } };
 
     const range_view = list_store.lrange(key, start_index, end_index);
-    return format.stringArrayRange(allocator, range_view);
+    return try stringArrayFromRangeView(allocator, range_view);
 }
 
-pub fn handleLlen(allocator: std.mem.Allocator, list_store: *db.ListStore, args: [64]?[]const u8) ![]const u8 {
-    const key = args[1] orelse return format.simpleError(allocator, format.ERR_ARG_NUM);
+pub fn handleLlen(list_store: *db.ListStore, args: [64]?[]const u8) !Reply {
+    const key = args[1] orelse return Reply{ .Error = .{ .kind = .ArgNum } };
     const length = list_store.length_by_key(key);
-    return format.integer(allocator, length);
+    return Reply{ .Integer = @intCast(length) };
 }
 
-pub fn handleLpop(allocator: std.mem.Allocator, list_store: *db.ListStore, args: [64]?[]const u8) ![]const u8 {
-    const key = args[1] orelse return format.simpleError(allocator, format.ERR_ARG_NUM);
+pub fn handleLpop(allocator: std.mem.Allocator, list_store: *db.ListStore, args: [64]?[]const u8) !Reply {
+    const key = args[1] orelse return Reply{ .Error = .{ .kind = .ArgNum } };
     const count_slice = args[2] orelse "1";
     const count = std.fmt.parseInt(u64, count_slice, 10) catch 1;
 
     const popped_values = try list_store.lpop(key, count, allocator);
 
     return switch (popped_values.len) {
-        0 => format.NULL_BULK_STRING,
-        1 => format.bulkString(allocator, popped_values[0]),
-        else => format.stringArray(allocator, popped_values),
+        0 => Reply{ .BulkString = null },
+        1 => Reply{ .BulkString = popped_values[0] },
+        else => try stringArrayReply(allocator, popped_values),
     };
+}
+
+pub fn handleBlpop(allocator: std.mem.Allocator, handler: *AppHandler, client_connection: *ClientConnection, args: [64]?[]const u8) !union(enum) { Value: Reply, Blocked } {
+    const key = args[1] orelse return .{ .Value = .{ .Error = .{ .kind = ErrorKind.ArgNum } } };
+    const timeout_slice = args[2] orelse return .{ .Value = .{ .Error = .{ .kind = ErrorKind.ArgNum } } };
+
+    const timeout = std.fmt.parseInt(u64, timeout_slice, 10) catch return .{ .Value = .{ .Error = .{ .kind = ErrorKind.NotInteger } } };
+    _ = timeout;
+
+    const popped_values = try handler.list_store.lpop(key, 1, allocator);
+    if (popped_values.len > 0) {
+        var arr = try allocator.alloc(Reply, 2);
+        arr[0] = Reply{ .BulkString = key };
+        arr[1] = Reply{ .BulkString = popped_values[0] };
+        return .{ .Value = .{ .Array = arr } };
+    }
+
+    var gop = try handler.blocked_clients_by_key.getOrPut(key);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = try handler.app_allocator.dupe(u8, key);
+        gop.value_ptr.* = .{};
+    }
+
+    const NodeType = std.DoublyLinkedList(std.posix.fd_t).Node;
+    const node_ptr = try handler.app_allocator.create(NodeType);
+    node_ptr.* = .{ .data = client_connection.fd };
+    gop.value_ptr.append(node_ptr);
+
+    client_connection.*.blocking_key = gop.key_ptr.*;
+    client_connection.*.blocking_node = node_ptr;
+
+    return .Blocked;
 }
