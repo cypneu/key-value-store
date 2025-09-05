@@ -74,7 +74,15 @@ pub fn Server(comptime H: type) type {
             var ready_list: [MAX_EPOLL_EVENTS]linux.epoll_event = undefined;
 
             main_loop: while (true) {
-                const num_events = posix.epoll_wait(self.epoll_fd, &ready_list, -1);
+                const now_us: i64 = std.time.microTimestamp();
+                const timeout_ms: c_int = self.handler.getNextTimeoutMs(now_us);
+                const num_events = posix.epoll_wait(self.epoll_fd, &ready_list, timeout_ms);
+
+                if (num_events == 0) {
+                    const now_after: i64 = std.time.microTimestamp();
+                    self.handler.expireDueWaiters(now_after);
+                    continue;
+                }
 
                 for (ready_list[0..num_events]) |event| {
                     const fd = event.data.fd;
@@ -87,6 +95,9 @@ pub fn Server(comptime H: type) type {
                         try self.handleClient(fd, event.events);
                     }
                 }
+
+                const now_after_events: i64 = std.time.microTimestamp();
+                self.handler.expireDueWaiters(now_after_events);
             }
         }
 

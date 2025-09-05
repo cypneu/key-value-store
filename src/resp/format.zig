@@ -11,9 +11,13 @@ pub fn writeReply(writer: anytype, r: Reply) !void {
             if (opt) |s| try writer.print("${d}\r\n{s}\r\n", .{ s.len, s }) else try writer.writeAll("$-1\r\n");
         },
         .Integer => |n| try writer.print(":{d}\r\n", .{n}),
-        .Array => |items| {
-            try writer.print("*{d}\r\n", .{items.len});
-            for (items) |it| try writeReply(writer, it);
+        .Array => |maybe_items| {
+            if (maybe_items) |items| {
+                try writer.print("*{d}\r\n", .{items.len});
+                for (items) |it| try writeReply(writer, it);
+            } else {
+                try writer.writeAll("*-1\r\n");
+            }
         },
         .Error => |e| {
             const msg = switch (e.kind) {

@@ -129,8 +129,8 @@ pub fn handleBlpop(allocator: std.mem.Allocator, handler: *AppHandler, client_co
     const key = args[1] orelse return .{ .Value = .{ .Error = .{ .kind = ErrorKind.ArgNum } } };
     const timeout_slice = args[2] orelse return .{ .Value = .{ .Error = .{ .kind = ErrorKind.ArgNum } } };
 
-    const timeout = std.fmt.parseInt(u64, timeout_slice, 10) catch return .{ .Value = .{ .Error = .{ .kind = ErrorKind.NotInteger } } };
-    _ = timeout;
+    const timeout_secs = std.fmt.parseFloat(f64, timeout_slice) catch return .{ .Value = .{ .Error = .{ .kind = ErrorKind.NotInteger } } };
+    if (timeout_secs < 0) return .{ .Value = .{ .Error = .{ .kind = ErrorKind.NotInteger } } };
 
     const popped_values = try handler.list_store.lpop(key, 1, allocator);
     if (popped_values.len > 0) {
@@ -153,6 +153,17 @@ pub fn handleBlpop(allocator: std.mem.Allocator, handler: *AppHandler, client_co
 
     client_connection.*.blocking_key = gop.key_ptr.*;
     client_connection.*.blocking_node = node_ptr;
+
+    if (timeout_secs > 0) {
+        const now_us: i64 = std.time.microTimestamp();
+        const delta_us: i64 = @intFromFloat(timeout_secs * @as(f64, @floatFromInt(std.time.us_per_s)));
+        const deadline_us: i64 = now_us + delta_us;
+        client_connection.*.deadline_us = deadline_us;
+
+        try handler.timeouts.add(.{ .deadline_us = deadline_us, .fd = client_connection.fd });
+    } else {
+        client_connection.*.deadline_us = null;
+    }
 
     return .Blocked;
 }
