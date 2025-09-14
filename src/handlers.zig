@@ -5,11 +5,11 @@ const ClientConnection = @import("state.zig").ClientConnection;
 const AppHandler = @import("state.zig").AppHandler;
 const Reply = @import("reply.zig").Reply;
 const ErrorKind = @import("reply.zig").ErrorKind;
-const Notify = @import("state.zig").Notify;
+const WriteOp = @import("state.zig").WriteOp;
 
 pub const CommandOutcome = struct {
     reply: Reply,
-    notify: []Notify,
+    notify: []WriteOp,
 };
 
 fn stringArrayReply(allocator: std.mem.Allocator, items: []const []const u8) !Reply {

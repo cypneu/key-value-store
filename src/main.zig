@@ -30,7 +30,7 @@ pub fn main() !void {
     var app_handler = AppHandler.init(allocator, &string_store, &list_store);
     defer app_handler.deinit();
 
-    var server_instance = try server.Server(AppHandler).init(&app_handler, "0.0.0.0", 6379);
+    var server_instance = try server.Server(AppHandler).init(&app_handler, "0.0.0.0", 6379, allocator);
     defer server_instance.deinit();
 
     try server_instance.run();

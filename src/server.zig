@@ -3,6 +3,7 @@ const net = std.net;
 const posix = std.posix;
 const linux = std.os.linux;
 const EPOLL = linux.EPOLL;
+const WriteOp = @import("state.zig").WriteOp;
 
 const log = std.log.scoped(.server);
 
@@ -15,11 +16,12 @@ pub fn Server(comptime H: type) type {
         const Self = @This();
 
         handler: *H,
+        allocator: std.mem.Allocator,
         epoll_fd: posix.fd_t,
         listener_fd: posix.fd_t,
         quit_fd: posix.fd_t,
 
-        pub fn init(handler: *H, host: []const u8, port: u16) !Server(H) {
+        pub fn init(handler: *H, host: []const u8, port: u16, allocator: std.mem.Allocator) !Server(H) {
             var sigmask = posix.empty_sigset;
             linux.sigaddset(&sigmask, posix.SIG.INT);
             linux.sigaddset(&sigmask, posix.SIG.TERM);
@@ -45,7 +47,7 @@ pub fn Server(comptime H: type) type {
             try addFdToEpoll(epoll_fd, quit_fd, EPOLL.IN);
             log.info("Server listening on {s}:{d}", .{ host, port });
 
-            return .{ .handler = handler, .epoll_fd = epoll_fd, .listener_fd = listener_fd, .quit_fd = quit_fd };
+            return .{ .handler = handler, .allocator = allocator, .epoll_fd = epoll_fd, .listener_fd = listener_fd, .quit_fd = quit_fd };
         }
 
         pub fn deinit(self: *Self) void {
@@ -55,36 +57,19 @@ pub fn Server(comptime H: type) type {
             log.info("Server shut down gracefully.", .{});
         }
 
-        fn handleClient(self: *Self, client_fd: posix.fd_t, events: u32) !void {
-            if ((events & (EPOLL.HUP | EPOLL.ERR)) != 0) return self.closeConnection(client_fd);
-
-            var client_file = std.fs.File{ .handle = client_fd };
-            var buffer: [READ_BUFFER_SIZE]u8 = undefined;
-
-            const bytes_read = client_file.read(&buffer) catch {
-                return self.closeConnection(client_fd);
-            };
-
-            if (bytes_read == 0) return self.closeConnection(client_fd);
-
-            try self.handler.handleRequest(client_fd, buffer[0..bytes_read]);
-        }
-
         pub fn run(self: *Self) !void {
             var ready_list: [MAX_EPOLL_EVENTS]linux.epoll_event = undefined;
 
             main_loop: while (true) {
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+
                 const now_us: i64 = std.time.microTimestamp();
                 const timeout_ms: c_int = self.handler.getNextTimeoutMs(now_us);
-                const num_events = posix.epoll_wait(self.epoll_fd, &ready_list, timeout_ms);
 
-                if (num_events == 0) {
-                    const now_after: i64 = std.time.microTimestamp();
-                    self.handler.expireDueWaiters(now_after);
-                    continue;
-                }
+                const events_ready = posix.epoll_wait(self.epoll_fd, &ready_list, timeout_ms);
 
-                for (ready_list[0..num_events]) |event| {
+                for (ready_list[0..events_ready]) |event| {
                     const fd = event.data.fd;
 
                     if (fd == self.quit_fd) {
@@ -92,12 +77,43 @@ pub fn Server(comptime H: type) type {
                     } else if (fd == self.listener_fd) {
                         try self.acceptConnection();
                     } else {
-                        try self.handleClient(fd, event.events);
+                        try self.handleClient(fd, event.events, arena.allocator());
                     }
                 }
 
-                const now_after_events: i64 = std.time.microTimestamp();
-                self.handler.expireDueWaiters(now_after_events);
+                const ops = try self.handler.expireDueWaiters(std.time.microTimestamp(), arena.allocator());
+                self.writeOps(ops);
+            }
+        }
+
+        fn handleClient(self: *Self, client_fd: posix.fd_t, events: u32, request_allocator: std.mem.Allocator) !void {
+            if ((events & (EPOLL.HUP | EPOLL.ERR)) != 0) return self.closeConnection(client_fd);
+
+            var client_file = std.fs.File{ .handle = client_fd };
+            var buffer: [READ_BUFFER_SIZE]u8 = undefined;
+
+            while (true) {
+                const bytes_read = client_file.read(&buffer) catch |e| switch (e) {
+                    error.WouldBlock => break,
+                    else => return self.closeConnection(client_fd),
+                };
+
+                const peer_closed = bytes_read == 0;
+                if (peer_closed) return self.closeConnection(client_fd);
+
+                const result = try self.handler.ingest(client_fd, buffer[0..bytes_read], request_allocator);
+                switch (result) {
+                    .Writes => |writes| self.writeOps(writes),
+                    .Blocked => {},
+                    .Close => return self.closeConnection(client_fd),
+                }
+            }
+        }
+
+        fn writeOps(self: *Self, ops: []WriteOp) void {
+            for (ops) |w| {
+                var out = std.fs.File{ .handle = w.fd };
+                out.writer().writeAll(w.bytes) catch self.closeConnection(w.fd);
             }
         }
 

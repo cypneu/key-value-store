@@ -5,10 +5,17 @@ const posix = std.posix;
 const format = @import("resp/format.zig");
 const Reply = @import("reply.zig").Reply;
 const Order = std.math.Order;
+const StreamParser = @import("resp/stream_parser.zig").StreamParser;
 
-pub const Notify = struct {
+pub const WriteOp = struct {
     fd: std.posix.fd_t,
     bytes: []const u8,
+};
+
+pub const IngestResult = union(enum) {
+    Writes: []WriteOp,
+    Blocked,
+    Close,
 };
 
 pub const ClientConnection = struct {
@@ -16,6 +23,10 @@ pub const ClientConnection = struct {
     blocking_key: ?[]const u8,
     blocking_node: ?*std.DoublyLinkedList(posix.fd_t).Node,
     deadline_us: ?i64,
+
+    read_buffer: std.ArrayList(u8),
+    read_start: usize,
+    parser: StreamParser,
 };
 
 pub const AppHandler = struct {
@@ -55,6 +66,10 @@ pub const AppHandler = struct {
     }
 
     pub fn deinit(self: *AppHandler) void {
+        var it_conn = self.connection_by_fd.iterator();
+        while (it_conn.next()) |entry| {
+            entry.value_ptr.read_buffer.deinit();
+        }
         var it = self.blocked_clients_by_key.iterator();
         while (it.next()) |entry| {
             self.app_allocator.free(entry.key_ptr.*);
@@ -65,35 +80,45 @@ pub const AppHandler = struct {
         self.timeouts.deinit();
     }
 
-    pub fn handleRequest(self: *AppHandler, client_fd: posix.fd_t, request_data: []const u8) !void {
-        var arena = std.heap.ArenaAllocator.init(self.app_allocator);
-        defer arena.deinit();
+    pub fn ingest(self: *AppHandler, client_fd: posix.fd_t, incoming: []const u8, request_allocator: std.mem.Allocator) !IngestResult {
+        const conn = self.connection_by_fd.getPtr(client_fd) orelse return .Close;
 
-        const request_allocator = arena.allocator();
+        try conn.read_buffer.appendSlice(incoming);
 
-        const client_connection = self.connection_by_fd.getPtr(client_fd).?;
-        const response = try dispatcher.processRequest(self, request_allocator, request_data, client_connection);
+        var notifications = std.ArrayList(WriteOp).init(request_allocator);
 
-        switch (response) {
-            .Immediate => |value| {
-                var client_file = std.fs.File{ .handle = client_fd };
-                client_file.writer().writeAll(value.bytes) catch self.removeConnection(client_fd);
+        while (true) {
+            const available = conn.read_buffer.items[conn.read_start..];
+            const outcome = conn.parser.parse(available);
+            switch (outcome) {
+                .NeedMore => break,
+                .Error => return .Close,
+                .Done => |done| {
+                    const single = try dispatcher.dispatchCommand(self, request_allocator, done.parts, conn);
+                    switch (single) {
+                        .Immediate => |value| {
+                            try notifications.append(.{ .fd = client_fd, .bytes = value.bytes });
+                            if (value.notify) |ns| try notifications.appendSlice(ns);
+                        },
+                        .Blocked => {},
+                    }
 
-                if (value.notify) |ns| {
-                    self.emitNotifications(ns);
-                }
-            },
-            .Blocked => {},
+                    conn.read_start += done.consumed;
+                    conn.parser.reset();
+
+                    if (conn.read_start == conn.read_buffer.items.len) {
+                        conn.read_buffer.clearRetainingCapacity();
+                        conn.read_start = 0;
+                        break;
+                    }
+                },
+            }
         }
-    }
 
-    pub fn emitNotifications(self: *AppHandler, notifications: []Notify) void {
-        for (notifications) |n| {
-            var out_file = std.fs.File{ .handle = n.fd };
-            out_file.writer().writeAll(n.bytes) catch {
-                self.removeConnection(n.fd);
-            };
+        if (notifications.items.len != 0) {
+            return .{ .Writes = try notifications.toOwnedSlice() };
         }
+        return .Blocked;
     }
 
     pub fn addConnection(self: *AppHandler, client_fd: posix.fd_t) !void {
@@ -102,11 +127,15 @@ pub const AppHandler = struct {
             .blocking_key = null,
             .blocking_node = null,
             .deadline_us = null,
+            .read_buffer = std.ArrayList(u8).init(self.app_allocator),
+            .read_start = 0,
+            .parser = StreamParser.init(),
         });
     }
 
     pub fn removeConnection(self: *AppHandler, client_fd: posix.fd_t) void {
         if (self.connection_by_fd.fetchRemove(client_fd)) |removed_connection| {
+            removed_connection.value.read_buffer.deinit();
             if (removed_connection.value.blocking_key) |key| {
                 const wait_list = self.blocked_clients_by_key.getPtr(key).?;
                 const node_ptr = removed_connection.value.blocking_node.?;
@@ -116,10 +145,10 @@ pub const AppHandler = struct {
         }
     }
 
-    pub fn drainWaitersForKey(self: *AppHandler, request_allocator: std.mem.Allocator, key: []const u8, pushed: usize) ![]Notify {
-        var notifications = std.ArrayList(Notify).init(request_allocator);
+    pub fn drainWaitersForKey(self: *AppHandler, request_allocator: std.mem.Allocator, key: []const u8, pushed: usize) ![]WriteOp {
+        var notifications = std.ArrayList(WriteOp).init(request_allocator);
 
-        const wait_list_ptr = self.blocked_clients_by_key.getPtr(key) orelse return &[_]Notify{};
+        const wait_list_ptr = self.blocked_clients_by_key.getPtr(key) orelse return &[_]WriteOp{};
 
         for (0..pushed) |_| {
             const popped_values = try self.list_store.lpop(key, 1, request_allocator);
@@ -147,20 +176,9 @@ pub const AppHandler = struct {
         return try notifications.toOwnedSlice();
     }
 
-    pub fn getNextTimeoutMs(self: *AppHandler, now_us: i64) c_int {
-        if (self.timeouts.peek()) |t| {
-            if (t.deadline_us <= now_us) return 0;
-            const delta_us: i64 = t.deadline_us - now_us;
-            const delta_ms_i64: i64 = @divTrunc(delta_us, @as(i64, @intCast(std.time.us_per_ms)));
-            const max_cint: c_int = std.math.maxInt(c_int);
-            if (delta_ms_i64 > max_cint) return max_cint;
-            if (delta_ms_i64 < 0) return 0;
-            return @intCast(delta_ms_i64);
-        }
-        return -1;
-    }
+    pub fn expireDueWaiters(self: *AppHandler, now_us: i64, request_allocator: std.mem.Allocator) ![]WriteOp {
+        var notifications = std.ArrayList(WriteOp).init(request_allocator);
 
-    pub fn expireDueWaiters(self: *AppHandler, now_us: i64) void {
         while (self.timeouts.peek()) |t| {
             if (t.deadline_us > now_us) break;
 
@@ -182,12 +200,27 @@ pub const AppHandler = struct {
                     conn.blocking_node = null;
                     conn.deadline_us = null;
 
-                    var out_file = std.fs.File{ .handle = fd };
-                    format.writeReply(out_file.writer(), Reply{ .Array = null }) catch {
-                        self.removeConnection(fd);
-                    };
+                    var buf = std.ArrayList(u8).init(request_allocator);
+                    try format.writeReply(buf.writer(), Reply{ .Array = null });
+                    const bytes = try buf.toOwnedSlice();
+                    try notifications.append(.{ .fd = fd, .bytes = bytes });
                 }
             }
         }
+
+        return try notifications.toOwnedSlice();
+    }
+
+    pub fn getNextTimeoutMs(self: *AppHandler, now_us: i64) c_int {
+        if (self.timeouts.peek()) |t| {
+            if (t.deadline_us <= now_us) return 0;
+            const delta_us: i64 = t.deadline_us - now_us;
+            const delta_ms_i64: i64 = @divTrunc(delta_us, @as(i64, @intCast(std.time.us_per_ms)));
+            const max_cint: c_int = std.math.maxInt(c_int);
+            if (delta_ms_i64 > max_cint) return max_cint;
+            if (delta_ms_i64 < 0) return 0;
+            return @intCast(delta_ms_i64);
+        }
+        return -1;
     }
 };
