@@ -9,7 +9,7 @@ const log = std.log.scoped(.server);
 
 const MAX_EPOLL_EVENTS = 128;
 const TCP_BACKLOG = 128;
-const READ_BUFFER_SIZE = 262144;
+const READ_BUFFER_SIZE = 6 * 1048576;
 
 pub fn Server(comptime H: type) type {
     return struct {
