@@ -146,14 +146,20 @@ pub const AppHandler = struct {
     }
 
     pub fn drainWaitersForKey(self: *AppHandler, request_allocator: std.mem.Allocator, key: []const u8, pushed: usize) ![]WriteOp {
-        var notifications = std.ArrayList(WriteOp).init(request_allocator);
+        const wait_list_ptr = self.blocked_clients_by_key.getPtr(key) orelse return &.{};
 
-        const wait_list_ptr = self.blocked_clients_by_key.getPtr(key) orelse return &[_]WriteOp{};
+        var notifications = std.ArrayList(WriteOp).init(request_allocator);
+        errdefer notifications.deinit();
 
         for (0..pushed) |_| {
-            const popped_values = try self.list_store.lpop(key, 1, request_allocator);
-
             const node_ptr = wait_list_ptr.popFirst() orelse break;
+
+            const popped_values = try self.list_store.lpop(key, 1, request_allocator);
+            if (popped_values.len == 0) {
+                wait_list_ptr.prepend(node_ptr);
+                break;
+            }
+
             const fd = node_ptr.data;
             defer self.app_allocator.destroy(node_ptr);
 
@@ -164,12 +170,14 @@ pub const AppHandler = struct {
             }
 
             var buf = std.ArrayList(u8).init(request_allocator);
-            var arr = try request_allocator.alloc(Reply, 2);
-            arr[0] = Reply{ .BulkString = key };
-            arr[1] = Reply{ .BulkString = popped_values[0] };
+            var replies: [2]Reply = .{
+                .{ .BulkString = key },
+                .{ .BulkString = popped_values[0] },
+            };
 
-            try format.writeReply(buf.writer(), Reply{ .Array = arr });
+            try format.writeReply(buf.writer(), Reply{ .Array = &replies });
             const bytes = try buf.toOwnedSlice();
+
             try notifications.append(.{ .fd = fd, .bytes = bytes });
         }
 

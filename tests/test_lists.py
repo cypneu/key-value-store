@@ -55,3 +55,26 @@ def test_blpop_blocks_until_push(server_proc, make_key):
     assert not worker.is_alive(), "BLPOP worker did not finish in time"
 
     assert replies.get_nowait() == [key, "z"]
+
+
+def test_rpush_after_waiter_consumed(conn, make_key):
+    key = make_key("list_waiter_cleanup")
+    replies = queue.Queue()
+
+    def blpop_worker():
+        with socket.create_connection(("127.0.0.1", 6379), timeout=2.0) as s:
+            replies.put(exec_command(s, "BLPOP", key, "1"))
+
+    worker = threading.Thread(target=blpop_worker)
+    worker.start()
+
+    time.sleep(0.05)
+    assert exec_command(conn, "RPUSH", key, "first") == 1
+
+    worker.join(timeout=2.0)
+    assert not worker.is_alive(), "BLPOP worker did not finish in time"
+    assert replies.get_nowait() == [key, "first"]
+
+    assert exec_command(conn, "LLEN", key) == 0
+    assert exec_command(conn, "RPUSH", key, "second") == 1
+    assert exec_command(conn, "LLEN", key) == 1
