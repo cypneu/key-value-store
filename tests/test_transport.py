@@ -1,7 +1,6 @@
 import socket
 import time
 
-import pytest
 
 from .utils import encode_command, exec_command, read_reply, send_in_chunks
 
@@ -24,10 +23,6 @@ def test_large_bulk_string_split_across_reads(conn, make_key):
     assert exec_command(conn, "GET", key) == value
 
 
-@pytest.mark.xfail(
-    reason="server closes connection when large replies require multiple writes",
-    raises=(ConnectionError, TimeoutError),
-)
 def test_large_bulk_string_requires_multiple_writes(server_proc, make_key):
     key = make_key("transport_write")
     value = "y" * (4 * 1024 * 1024)
