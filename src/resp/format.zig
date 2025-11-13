@@ -24,7 +24,7 @@ pub fn writeReply(writer: anytype, r: Reply) !void {
                 .ArgNum => "ERR wrong number of arguments",
                 .Syntax => "ERR syntax error",
                 .NotInteger => "ERR value is not an integer or out of range",
-                .Custom => e.msg orelse "ERR",
+                .WrongType => "WRONGTYPE Operation against a key holding the wrong kind of value",
             };
             try writer.print("-{s}\r\n", .{msg});
         },

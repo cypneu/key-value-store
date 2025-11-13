@@ -3,6 +3,8 @@ import socket
 import threading
 import time
 
+import pytest
+
 from .utils import exec_command
 
 
@@ -16,6 +18,20 @@ def test_rpush_and_llen(conn, make_key):
     key = make_key("list_len")
     assert exec_command(conn, "RPUSH", key, "x", "y") == 2
     assert exec_command(conn, "LLEN", key) == 2
+
+
+def test_lpush_on_string_returns_wrongtype(conn, make_key):
+    key = make_key("list_push_wrongtype")
+    assert exec_command(conn, "SET", key, "value") == "OK"
+    with pytest.raises(RuntimeError, match="WRONGTYPE"):
+        exec_command(conn, "LPUSH", key, "one")
+
+
+def test_lpop_on_string_returns_wrongtype(conn, make_key):
+    key = make_key("list_lpop_wrongtype")
+    assert exec_command(conn, "SET", key, "value") == "OK"
+    with pytest.raises(RuntimeError, match="WRONGTYPE"):
+        exec_command(conn, "LPOP", key)
 
 
 def test_lpop_single_and_multiple(conn, make_key):

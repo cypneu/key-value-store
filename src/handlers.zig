@@ -12,6 +12,10 @@ pub const CommandOutcome = struct {
     notify: []WriteOp,
 };
 
+fn wrongTypeReply() Reply {
+    return Reply{ .Error = .{ .kind = ErrorKind.WrongType } };
+}
+
 fn stringArrayReply(allocator: std.mem.Allocator, items: []const []const u8) !Reply {
     var arr = try allocator.alloc(Reply, items.len);
     for (items, 0..) |s, i| {
@@ -39,8 +43,9 @@ pub fn handleEcho(args: [64]?[]const u8) !Reply {
     return Reply{ .BulkString = content };
 }
 
-pub fn handleGet(string_store: *db.StringStore, args: [64]?[]const u8) !Reply {
+pub fn handleGet(string_store: *db.StringStore, list_store: *db.ListStore, args: [64]?[]const u8) !Reply {
     const key = args[1] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
+    if (list_store.contains(key)) return wrongTypeReply();
     return Reply{ .BulkString = string_store.get(key) };
 }
 
@@ -50,7 +55,7 @@ fn calculateExpiration(ttl_ms: u64) i64 {
     return current_micros + ttl_us;
 }
 
-pub fn handleSet(store: *db.StringStore, args: [64]?[]const u8) !Reply {
+pub fn handleSet(string_store: *db.StringStore, list_store: *db.ListStore, args: [64]?[]const u8) !Reply {
     const key = args[1] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
     const value_slice = args[2] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
     const px_command = args[3] orelse "";
@@ -62,7 +67,9 @@ pub fn handleSet(store: *db.StringStore, args: [64]?[]const u8) !Reply {
         expiration_us = calculateExpiration(px_value_ms);
     }
 
-    try store.set(key, value_slice, expiration_us);
+    list_store.delete(key);
+
+    try string_store.set(key, value_slice, expiration_us);
     return .{ .SimpleString = "OK" };
 }
 
@@ -76,6 +83,10 @@ pub fn handleRpush(allocator: std.mem.Allocator, handler: *AppHandler, args: [64
 
 fn handlePush(comptime is_left: bool, allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !CommandOutcome {
     const key = args[1] orelse return .{ .reply = Reply{ .Error = .{ .kind = ErrorKind.ArgNum } }, .notify = &.{} };
+
+    if (handler.string_store.contains(key)) {
+        return .{ .reply = wrongTypeReply(), .notify = &.{} };
+    }
 
     var length: u64 = 0;
     var pushed: usize = 0;
@@ -93,7 +104,12 @@ fn handlePush(comptime is_left: bool, allocator: std.mem.Allocator, handler: *Ap
     };
 }
 
-pub fn handleLrange(allocator: std.mem.Allocator, list_store: *db.ListStore, args: [64]?[]const u8) !Reply {
+pub fn handleLrange(
+    allocator: std.mem.Allocator,
+    string_store: *db.StringStore,
+    list_store: *db.ListStore,
+    args: [64]?[]const u8,
+) !Reply {
     const key = args[1] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
     const start_index_slice = args[2] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
     const end_index_slice = args[3] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
@@ -101,20 +117,30 @@ pub fn handleLrange(allocator: std.mem.Allocator, list_store: *db.ListStore, arg
     const start_index = std.fmt.parseInt(i64, start_index_slice, 10) catch return .{ .Error = .{ .kind = ErrorKind.NotInteger } };
     const end_index = std.fmt.parseInt(i64, end_index_slice, 10) catch return .{ .Error = .{ .kind = ErrorKind.NotInteger } };
 
+    if (string_store.contains(key)) return wrongTypeReply();
+
     const range_view = list_store.lrange(key, start_index, end_index);
     return try stringArrayFromRangeView(allocator, range_view);
 }
 
-pub fn handleLlen(list_store: *db.ListStore, args: [64]?[]const u8) !Reply {
+pub fn handleLlen(string_store: *db.StringStore, list_store: *db.ListStore, args: [64]?[]const u8) !Reply {
     const key = args[1] orelse return Reply{ .Error = .{ .kind = .ArgNum } };
+    if (string_store.contains(key)) return wrongTypeReply();
     const length = list_store.length_by_key(key);
     return Reply{ .Integer = @intCast(length) };
 }
 
-pub fn handleLpop(allocator: std.mem.Allocator, list_store: *db.ListStore, args: [64]?[]const u8) !Reply {
+pub fn handleLpop(
+    allocator: std.mem.Allocator,
+    string_store: *db.StringStore,
+    list_store: *db.ListStore,
+    args: [64]?[]const u8,
+) !Reply {
     const key = args[1] orelse return Reply{ .Error = .{ .kind = .ArgNum } };
     const count_slice = args[2] orelse "1";
     const count = std.fmt.parseInt(u64, count_slice, 10) catch 1;
+
+    if (string_store.contains(key)) return wrongTypeReply();
 
     const popped_values = try list_store.lpop(key, count, allocator);
 
@@ -131,6 +157,10 @@ pub fn handleBlpop(allocator: std.mem.Allocator, handler: *AppHandler, client_co
 
     const timeout_secs = std.fmt.parseFloat(f64, timeout_slice) catch return .{ .Value = .{ .Error = .{ .kind = ErrorKind.NotInteger } } };
     if (timeout_secs < 0) return .{ .Value = .{ .Error = .{ .kind = ErrorKind.NotInteger } } };
+
+    if (handler.string_store.contains(key)) {
+        return .{ .Value = wrongTypeReply() };
+    }
 
     const popped_values = try handler.list_store.lpop(key, 1, allocator);
     if (popped_values.len > 0) {

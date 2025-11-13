@@ -84,7 +84,23 @@ pub const ListStore = struct {
             self.allocator.free(val);
         }
 
+        if (entry.value_ptr.len == 0) {
+            self.delete(key);
+        }
+
         return output;
+    }
+
+    pub fn delete(self: *ListStore, key: []const u8) void {
+        if (self.data.fetchRemove(key)) |removed| {
+            var deque = removed.value;
+            deque.deinit();
+            self.allocator.free(removed.key);
+        }
+    }
+
+    pub fn contains(self: *ListStore, key: []const u8) bool {
+        return self.data.get(key) != null;
     }
 };
 

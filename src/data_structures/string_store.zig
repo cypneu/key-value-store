@@ -48,12 +48,28 @@ pub const StringStore = struct {
         const entry = self.data.getEntry(key) orelse return null;
 
         if (entry.value_ptr.isExpired()) {
-            if (self.data.fetchRemove(key)) |removed| {
-                self.allocator.free(removed.value.data);
-            }
+            self.delete(key);
             return null;
         }
 
         return entry.value_ptr.data;
+    }
+
+    pub fn delete(self: *StringStore, key: []const u8) void {
+        if (self.data.fetchRemove(key)) |removed| {
+            self.allocator.free(removed.value.data);
+            self.allocator.free(removed.key);
+        }
+    }
+
+    pub fn contains(self: *StringStore, key: []const u8) bool {
+        const entry = self.data.getEntry(key) orelse return false;
+
+        if (entry.value_ptr.isExpired()) {
+            self.delete(key);
+            return false;
+        }
+
+        return true;
     }
 };
