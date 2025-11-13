@@ -12,6 +12,7 @@ pub const Command = enum {
     LPOP,
     BLPOP,
     TYPE,
+    XADD,
 
     pub fn fromSlice(slice: []const u8) ?Command {
         if (std.ascii.eqlIgnoreCase(slice, "PING")) return .PING;
@@ -25,6 +26,7 @@ pub const Command = enum {
         if (std.ascii.eqlIgnoreCase(slice, "LPOP")) return .LPOP;
         if (std.ascii.eqlIgnoreCase(slice, "BLPOP")) return .BLPOP;
         if (std.ascii.eqlIgnoreCase(slice, "TYPE")) return .TYPE;
+        if (std.ascii.eqlIgnoreCase(slice, "XADD")) return .XADD;
         return null;
     }
 };

@@ -25,6 +25,8 @@ pub fn writeReply(writer: anytype, r: Reply) !void {
                 .Syntax => "ERR syntax error",
                 .NotInteger => "ERR value is not an integer or out of range",
                 .WrongType => "WRONGTYPE Operation against a key holding the wrong kind of value",
+                .XaddIdTooSmall => "ERR The ID specified in XADD is equal or smaller than the target stream top item",
+                .XaddIdNotGreaterThanZero => "ERR The ID specified in XADD must be greater than 0-0",
             };
             try writer.print("-{s}\r\n", .{msg});
         },

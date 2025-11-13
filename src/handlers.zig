@@ -38,22 +38,42 @@ fn stringArrayFromRangeView(allocator: std.mem.Allocator, rv: db.RangeView([]con
     return Reply{ .Array = arr };
 }
 
+fn argumentCount(args: [64]?[]const u8) usize {
+    var count: usize = 0;
+    while (count < args.len) : (count += 1) {
+        if (args[count] == null) break;
+    }
+    return count;
+}
+
 pub fn handleEcho(args: [64]?[]const u8) !Reply {
     const content = args[1] orelse return .{ .BulkString = null };
     return Reply{ .BulkString = content };
 }
 
-pub fn handleGet(string_store: *db.StringStore, list_store: *db.ListStore, args: [64]?[]const u8) !Reply {
+pub fn handleGet(
+    string_store: *db.StringStore,
+    list_store: *db.ListStore,
+    stream_store: *db.StreamStore,
+    args: [64]?[]const u8,
+) !Reply {
     const key = args[1] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
     if (list_store.contains(key)) return wrongTypeReply();
+    if (stream_store.contains(key)) return wrongTypeReply();
     return Reply{ .BulkString = string_store.get(key) };
 }
 
-pub fn handleType(string_store: *db.StringStore, list_store: *db.ListStore, args: [64]?[]const u8) !Reply {
+pub fn handleType(
+    string_store: *db.StringStore,
+    list_store: *db.ListStore,
+    stream_store: *db.StreamStore,
+    args: [64]?[]const u8,
+) !Reply {
     const key = args[1] orelse return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
 
     if (string_store.contains(key)) return Reply{ .SimpleString = "string" };
     if (list_store.contains(key)) return Reply{ .SimpleString = "list" };
+    if (stream_store.contains(key)) return Reply{ .SimpleString = "stream" };
 
     return Reply{ .SimpleString = "none" };
 }
@@ -64,7 +84,12 @@ fn calculateExpiration(ttl_ms: u64) i64 {
     return current_micros + ttl_us;
 }
 
-pub fn handleSet(string_store: *db.StringStore, list_store: *db.ListStore, args: [64]?[]const u8) !Reply {
+pub fn handleSet(
+    string_store: *db.StringStore,
+    list_store: *db.ListStore,
+    stream_store: *db.StreamStore,
+    args: [64]?[]const u8,
+) !Reply {
     const key = args[1] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
     const value_slice = args[2] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
     const px_command = args[3] orelse "";
@@ -77,6 +102,7 @@ pub fn handleSet(string_store: *db.StringStore, list_store: *db.ListStore, args:
     }
 
     list_store.delete(key);
+    stream_store.delete(key);
 
     try string_store.set(key, value_slice, expiration_us);
     return .{ .SimpleString = "OK" };
@@ -93,7 +119,7 @@ pub fn handleRpush(allocator: std.mem.Allocator, handler: *AppHandler, args: [64
 fn handlePush(comptime is_left: bool, allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !CommandOutcome {
     const key = args[1] orelse return .{ .reply = Reply{ .Error = .{ .kind = ErrorKind.ArgNum } }, .notify = &.{} };
 
-    if (handler.string_store.contains(key)) {
+    if (handler.string_store.contains(key) or handler.stream_store.contains(key)) {
         return .{ .reply = wrongTypeReply(), .notify = &.{} };
     }
 
@@ -117,6 +143,7 @@ pub fn handleLrange(
     allocator: std.mem.Allocator,
     string_store: *db.StringStore,
     list_store: *db.ListStore,
+    stream_store: *db.StreamStore,
     args: [64]?[]const u8,
 ) !Reply {
     const key = args[1] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
@@ -127,14 +154,21 @@ pub fn handleLrange(
     const end_index = std.fmt.parseInt(i64, end_index_slice, 10) catch return .{ .Error = .{ .kind = ErrorKind.NotInteger } };
 
     if (string_store.contains(key)) return wrongTypeReply();
+    if (stream_store.contains(key)) return wrongTypeReply();
 
     const range_view = list_store.lrange(key, start_index, end_index);
     return try stringArrayFromRangeView(allocator, range_view);
 }
 
-pub fn handleLlen(string_store: *db.StringStore, list_store: *db.ListStore, args: [64]?[]const u8) !Reply {
+pub fn handleLlen(
+    string_store: *db.StringStore,
+    list_store: *db.ListStore,
+    stream_store: *db.StreamStore,
+    args: [64]?[]const u8,
+) !Reply {
     const key = args[1] orelse return Reply{ .Error = .{ .kind = .ArgNum } };
     if (string_store.contains(key)) return wrongTypeReply();
+    if (stream_store.contains(key)) return wrongTypeReply();
     const length = list_store.length_by_key(key);
     return Reply{ .Integer = @intCast(length) };
 }
@@ -143,6 +177,7 @@ pub fn handleLpop(
     allocator: std.mem.Allocator,
     string_store: *db.StringStore,
     list_store: *db.ListStore,
+    stream_store: *db.StreamStore,
     args: [64]?[]const u8,
 ) !Reply {
     const key = args[1] orelse return Reply{ .Error = .{ .kind = .ArgNum } };
@@ -150,6 +185,7 @@ pub fn handleLpop(
     const count = std.fmt.parseInt(u64, count_slice, 10) catch 1;
 
     if (string_store.contains(key)) return wrongTypeReply();
+    if (stream_store.contains(key)) return wrongTypeReply();
 
     const popped_values = try list_store.lpop(key, count, allocator);
 
@@ -160,6 +196,41 @@ pub fn handleLpop(
     };
 }
 
+pub fn handleXadd(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !Reply {
+    const key = args[1] orelse return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
+    const entry_id = args[2] orelse return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
+
+    if (handler.string_store.contains(key)) return wrongTypeReply();
+    if (handler.list_store.contains(key)) return wrongTypeReply();
+
+    const arg_count = argumentCount(args);
+    if (arg_count < 5) return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
+    const field_value_count = arg_count - 3;
+    if ((field_value_count % 2) != 0) return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
+
+    var pairs = std.ArrayList(db.StreamFieldValue).init(allocator);
+    defer pairs.deinit();
+
+    var index: usize = 3;
+    while (index < arg_count) : (index += 2) {
+        const field = args[index].?;
+        const value = args[index + 1].?;
+        try pairs.append(.{ .field = field, .value = value });
+    }
+
+    if (pairs.items.len == 0) return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
+
+    handler.stream_store.addEntry(key, entry_id, pairs.items) catch |err| {
+        return switch (err) {
+            error.EntryIdTooSmall => Reply{ .Error = .{ .kind = ErrorKind.XaddIdTooSmall } },
+            error.EntryIdZero => Reply{ .Error = .{ .kind = ErrorKind.XaddIdNotGreaterThanZero } },
+            error.InvalidEntryId => Reply{ .Error = .{ .kind = ErrorKind.Syntax } },
+            else => return err,
+        };
+    };
+    return Reply{ .BulkString = entry_id };
+}
+
 pub fn handleBlpop(allocator: std.mem.Allocator, handler: *AppHandler, client_connection: *ClientConnection, args: [64]?[]const u8) !union(enum) { Value: Reply, Blocked } {
     const key = args[1] orelse return .{ .Value = .{ .Error = .{ .kind = ErrorKind.ArgNum } } };
     const timeout_slice = args[2] orelse return .{ .Value = .{ .Error = .{ .kind = ErrorKind.ArgNum } } };
@@ -168,6 +239,10 @@ pub fn handleBlpop(allocator: std.mem.Allocator, handler: *AppHandler, client_co
     if (timeout_secs < 0) return .{ .Value = .{ .Error = .{ .kind = ErrorKind.NotInteger } } };
 
     if (handler.string_store.contains(key)) {
+        return .{ .Value = wrongTypeReply() };
+    }
+
+    if (handler.stream_store.contains(key)) {
         return .{ .Value = wrongTypeReply() };
     }
 

@@ -56,9 +56,9 @@ fn processImmediateCommand(
     const reply: Reply = switch (command) {
         .PING => Reply{ .SimpleString = "PONG" },
         .ECHO => try handlers.handleEcho(command_parts),
-        .GET => try handlers.handleGet(handler.string_store, handler.list_store, command_parts),
-        .TYPE => try handlers.handleType(handler.string_store, handler.list_store, command_parts),
-        .SET => try handlers.handleSet(handler.string_store, handler.list_store, command_parts),
+        .GET => try handlers.handleGet(handler.string_store, handler.list_store, handler.stream_store, command_parts),
+        .TYPE => try handlers.handleType(handler.string_store, handler.list_store, handler.stream_store, command_parts),
+        .SET => try handlers.handleSet(handler.string_store, handler.list_store, handler.stream_store, command_parts),
 
         .LPUSH => blk: {
             const out = try handlers.handleLpush(allocator, handler, command_parts);
@@ -70,10 +70,11 @@ fn processImmediateCommand(
             try appendNotify(&notify_acc, out.notify);
             break :blk out.reply;
         },
-        .LRANGE => try handlers.handleLrange(allocator, handler.string_store, handler.list_store, command_parts),
-        .LLEN => try handlers.handleLlen(handler.string_store, handler.list_store, command_parts),
-        .LPOP => try handlers.handleLpop(allocator, handler.string_store, handler.list_store, command_parts),
+        .LRANGE => try handlers.handleLrange(allocator, handler.string_store, handler.list_store, handler.stream_store, command_parts),
+        .LLEN => try handlers.handleLlen(handler.string_store, handler.list_store, handler.stream_store, command_parts),
+        .LPOP => try handlers.handleLpop(allocator, handler.string_store, handler.list_store, handler.stream_store, command_parts),
         .BLPOP => unreachable,
+        .XADD => try handlers.handleXadd(allocator, handler, command_parts),
     };
 
     const notify_slice: ?[]WriteOp = if (notify_acc.items.len != 0)

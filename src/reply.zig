@@ -1,4 +1,11 @@
-pub const ErrorKind = enum { ArgNum, Syntax, NotInteger, WrongType };
+pub const ErrorKind = enum {
+    ArgNum,
+    Syntax,
+    NotInteger,
+    WrongType,
+    XaddIdTooSmall,
+    XaddIdNotGreaterThanZero,
+};
 
 pub const Reply = union(enum) {
     SimpleString: []const u8,

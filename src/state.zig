@@ -33,6 +33,7 @@ pub const AppHandler = struct {
     app_allocator: std.mem.Allocator,
     string_store: *db.StringStore,
     list_store: *db.ListStore,
+    stream_store: *db.StreamStore,
 
     connection_by_fd: std.hash_map.AutoHashMap(posix.fd_t, ClientConnection),
     blocked_clients_by_key: std.hash_map.StringHashMap(std.DoublyLinkedList(posix.fd_t)),
@@ -50,7 +51,12 @@ pub const AppHandler = struct {
 
     const TimeoutQueue = std.PriorityQueue(TimeoutEntry, void, timeoutCompare);
 
-    pub fn init(allocator: std.mem.Allocator, string_store: *db.StringStore, list_store: *db.ListStore) AppHandler {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        string_store: *db.StringStore,
+        list_store: *db.ListStore,
+        stream_store: *db.StreamStore,
+    ) AppHandler {
         const connection_by_fd = std.hash_map.AutoHashMap(posix.fd_t, ClientConnection).init(allocator);
         const blocked_clients_by_key = std.hash_map.StringHashMap(std.DoublyLinkedList(posix.fd_t)).init(allocator);
         const timeouts = TimeoutQueue.init(allocator, {});
@@ -59,6 +65,7 @@ pub const AppHandler = struct {
             .app_allocator = allocator,
             .string_store = string_store,
             .list_store = list_store,
+            .stream_store = stream_store,
             .connection_by_fd = connection_by_fd,
             .blocked_clients_by_key = blocked_clients_by_key,
             .timeouts = timeouts,

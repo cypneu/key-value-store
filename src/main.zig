@@ -27,7 +27,10 @@ pub fn main() !void {
     var list_store = db.ListStore.init(allocator);
     defer list_store.deinit();
 
-    var app_handler = AppHandler.init(allocator, &string_store, &list_store);
+    var stream_store = db.StreamStore.init(allocator);
+    defer stream_store.deinit();
+
+    var app_handler = AppHandler.init(allocator, &string_store, &list_store, &stream_store);
     defer app_handler.deinit();
 
     var server_instance = try server.Server(AppHandler).init(&app_handler, "0.0.0.0", 6379, allocator);
