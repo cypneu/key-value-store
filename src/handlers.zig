@@ -49,6 +49,15 @@ pub fn handleGet(string_store: *db.StringStore, list_store: *db.ListStore, args:
     return Reply{ .BulkString = string_store.get(key) };
 }
 
+pub fn handleType(string_store: *db.StringStore, list_store: *db.ListStore, args: [64]?[]const u8) !Reply {
+    const key = args[1] orelse return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
+
+    if (string_store.contains(key)) return Reply{ .SimpleString = "string" };
+    if (list_store.contains(key)) return Reply{ .SimpleString = "list" };
+
+    return Reply{ .SimpleString = "none" };
+}
+
 fn calculateExpiration(ttl_ms: u64) i64 {
     const current_micros = std.time.microTimestamp();
     const ttl_us: i64 = @intCast(ttl_ms * std.time.us_per_ms);
