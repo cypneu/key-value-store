@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from .utils import exec_command
@@ -50,3 +52,26 @@ def test_xadd_rejects_zero_id(conn, make_key):
 
     with pytest.raises(RuntimeError, match="ERR The ID specified in XADD must be greater than 0-0"):
         exec_command(conn, "XADD", key, "0-0", "sensor", "value")
+
+
+def test_xadd_auto_generates_sequence(conn, make_key):
+    key = make_key("stream_auto_sequence")
+
+    assert exec_command(conn, "XADD", key, "0-*", "foo", "bar") == "0-1"
+    assert exec_command(conn, "XADD", key, "5-*", "foo", "bar") == "5-0"
+    assert exec_command(conn, "XADD", key, "5-*", "bar", "baz") == "5-1"
+
+
+def test_xadd_auto_generates_full_id(conn, make_key):
+    key = make_key("stream_auto_full")
+
+    start_ms = int(time.time() * 1000)
+    entry_id = exec_command(conn, "XADD", key, "*", "foo", "bar")
+    end_ms = int(time.time() * 1000)
+
+    ms_part, seq_part = entry_id.split("-")
+    ts_ms = int(ms_part)
+    seq = int(seq_part)
+
+    assert start_ms <= ts_ms <= end_ms
+    assert seq == 0

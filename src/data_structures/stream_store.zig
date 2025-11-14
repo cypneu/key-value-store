@@ -130,20 +130,87 @@ pub const StreamStore = struct {
         if (!entry_id.isGreaterThan(last_id)) return error.EntryIdTooSmall;
     }
 
-    pub fn addEntry(self: *StreamStore, key: []const u8, entry_id: []const u8, field_values: []const FieldValue) !void {
+    fn nextSequence(stream: *Stream, milliseconds: u64) !u64 {
+        const entries = stream.entries.items;
+        if (entries.len == 0) {
+            return if (milliseconds == 0) 1 else 0;
+        }
+
+        const last_entry = entries[entries.len - 1];
+        const last_id = EntryId.parse(last_entry.id) catch unreachable;
+
+        if (milliseconds == last_id.milliseconds) {
+            return last_id.sequence + 1;
+        }
+
+        if (milliseconds < last_id.milliseconds) {
+            return error.EntryIdTooSmall;
+        }
+
+        return if (milliseconds == 0) 1 else 0;
+    }
+
+    fn generateAutoEntryId(stream: *Stream) EntryId {
+        const now_ms_signed = std.time.milliTimestamp();
+        const now_ms: u64 = if (now_ms_signed < 0) 0 else @intCast(now_ms_signed);
+
+        var milliseconds = now_ms;
+        var sequence: u64 = if (milliseconds == 0) 1 else 0;
+
+        const entries = stream.entries.items;
+        if (entries.len > 0) {
+            const last_entry = entries[entries.len - 1];
+            const last_id = EntryId.parse(last_entry.id) catch unreachable;
+
+            if (milliseconds <= last_id.milliseconds) {
+                milliseconds = last_id.milliseconds;
+                sequence = last_id.sequence + 1;
+            }
+        }
+
+        return .{ .milliseconds = milliseconds, .sequence = sequence };
+    }
+
+    fn resolveEntryId(stream: *Stream, entry_id: []const u8, buffer: []u8) ![]const u8 {
+        if (entry_id.len == 1 and entry_id[0] == '*') {
+            const auto_id = generateAutoEntryId(stream);
+            return try std.fmt.bufPrint(buffer, "{d}-{d}", .{ auto_id.milliseconds, auto_id.sequence });
+        }
+
+        const dash_index = std.mem.indexOfScalar(u8, entry_id, '-') orelse return error.InvalidEntryId;
+        if (dash_index == 0 or dash_index + 1 >= entry_id.len) return error.InvalidEntryId;
+
+        const seq_slice = entry_id[dash_index + 1 ..];
+        if (seq_slice.len == 1 and seq_slice[0] == '*') {
+            const ms_slice = entry_id[0..dash_index];
+            const milliseconds = std.fmt.parseInt(u64, ms_slice, 10) catch return error.InvalidEntryId;
+            const sequence = try nextSequence(stream, milliseconds);
+
+            return try std.fmt.bufPrint(buffer, "{d}-{d}", .{ milliseconds, sequence });
+        }
+
+        return entry_id;
+    }
+
+    pub fn addEntry(self: *StreamStore, key: []const u8, entry_id: []const u8, field_values: []const FieldValue) ![]const u8 {
         var gop = try self.data.getOrPut(key);
         if (!gop.found_existing) {
             gop.key_ptr.* = try self.allocator.dupe(u8, key);
             gop.value_ptr.* = .{};
         }
 
-        const parsed_id = EntryId.parse(entry_id) catch return error.InvalidEntryId;
+        var id_buffer: [64]u8 = undefined;
+        const resolved_entry_id = try resolveEntryId(gop.value_ptr, entry_id, id_buffer[0..]);
+
+        const parsed_id = EntryId.parse(resolved_entry_id) catch return error.InvalidEntryId;
         try ensureValidEntryId(gop.value_ptr, parsed_id);
 
-        var entry = try StreamEntry.init(self.allocator, entry_id, field_values);
+        var entry = try StreamEntry.init(self.allocator, resolved_entry_id, field_values);
         errdefer entry.deinit(self.allocator);
 
         try gop.value_ptr.appendEntry(self.allocator, entry);
+        const stored_entry = gop.value_ptr.entries.items[gop.value_ptr.entries.items.len - 1];
+        return stored_entry.id;
     }
 
     pub fn contains(self: *StreamStore, key: []const u8) bool {

@@ -220,7 +220,7 @@ pub fn handleXadd(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]
 
     if (pairs.items.len == 0) return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
 
-    handler.stream_store.addEntry(key, entry_id, pairs.items) catch |err| {
+    const stored_entry_id = handler.stream_store.addEntry(key, entry_id, pairs.items) catch |err| {
         return switch (err) {
             error.EntryIdTooSmall => Reply{ .Error = .{ .kind = ErrorKind.XaddIdTooSmall } },
             error.EntryIdZero => Reply{ .Error = .{ .kind = ErrorKind.XaddIdNotGreaterThanZero } },
@@ -228,7 +228,7 @@ pub fn handleXadd(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]
             else => return err,
         };
     };
-    return Reply{ .BulkString = entry_id };
+    return Reply{ .BulkString = stored_entry_id };
 }
 
 pub fn handleBlpop(allocator: std.mem.Allocator, handler: *AppHandler, client_connection: *ClientConnection, args: [64]?[]const u8) !union(enum) { Value: Reply, Blocked } {
