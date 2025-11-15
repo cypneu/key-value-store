@@ -88,3 +88,29 @@ def test_xrange_returns_entries(conn, make_key):
         ["0-2", ["bar", "baz"]],
         ["0-3", ["baz", "foo"]],
     ]
+
+
+def test_xrange_allows_dash_start(conn, make_key):
+    key = make_key("stream_xrange_dash")
+
+    assert exec_command(conn, "XADD", key, "0-1", "foo", "bar") == "0-1"
+    assert exec_command(conn, "XADD", key, "0-2", "bar", "baz") == "0-2"
+    assert exec_command(conn, "XADD", key, "0-3", "baz", "foo") == "0-3"
+
+    assert exec_command(conn, "XRANGE", key, "-", "0-2") == [
+        ["0-1", ["foo", "bar"]],
+        ["0-2", ["bar", "baz"]],
+    ]
+
+
+def test_xrange_allows_plus_end(conn, make_key):
+    key = make_key("stream_xrange_plus")
+
+    assert exec_command(conn, "XADD", key, "0-1", "foo", "bar") == "0-1"
+    assert exec_command(conn, "XADD", key, "0-2", "bar", "baz") == "0-2"
+    assert exec_command(conn, "XADD", key, "0-3", "baz", "foo") == "0-3"
+
+    assert exec_command(conn, "XRANGE", key, "0-2", "+") == [
+        ["0-2", ["bar", "baz"]],
+        ["0-3", ["baz", "foo"]],
+    ]

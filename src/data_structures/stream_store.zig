@@ -25,6 +25,13 @@ const EntryId = struct {
     fn parseRangeBound(entry_id: []const u8, comptime is_start: bool) !EntryId {
         if (entry_id.len == 0) return error.InvalidEntryId;
 
+        if (is_start and entry_id.len == 1 and entry_id[0] == '-') {
+            return .{ .milliseconds = 0, .sequence = 0 };
+        }
+        if (!is_start and entry_id.len == 1 and entry_id[0] == '+') {
+            return .{ .milliseconds = std.math.maxInt(u64), .sequence = std.math.maxInt(u64) };
+        }
+
         if (std.mem.indexOfScalar(u8, entry_id, '-')) |dash_index| {
             return try parseParts(entry_id, dash_index);
         }
