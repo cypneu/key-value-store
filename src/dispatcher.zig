@@ -22,13 +22,15 @@ pub fn dispatchCommand(handler: *AppHandler, request_allocator: std.mem.Allocato
     const command_str = command_parts[0] orelse return emptyImmediate();
     const command = Command.fromSlice(command_str) orelse return emptyImmediate();
 
-    if (command == .BLPOP) {
-        return handleBlockingBlpop(request_allocator, handler, client_connection, command_parts);
-    }
-
-    const immediate = try processImmediateCommand(request_allocator, handler, command, command_parts);
-    const bytes = try renderReply(request_allocator, immediate.reply);
-    return makeImmediate(bytes, immediate.notify);
+    return switch (command) {
+        .BLPOP => handleBlockingBlpop(request_allocator, handler, client_connection, command_parts),
+        .XREAD => handleBlockingXread(request_allocator, handler, client_connection, command_parts),
+        else => blk: {
+            const immediate = try processImmediateCommand(request_allocator, handler, command, command_parts);
+            const bytes = try renderReply(request_allocator, immediate.reply);
+            break :blk makeImmediate(bytes, immediate.notify);
+        },
+    };
 }
 
 fn handleBlockingBlpop(
@@ -39,6 +41,19 @@ fn handleBlockingBlpop(
 ) !ProcessResult {
     const blpop_result = try handlers.handleBlpop(allocator, handler, connection, command_parts);
     return switch (blpop_result) {
+        .Value => |reply| makeImmediate(try renderReply(allocator, reply), null),
+        .Blocked => ProcessResult.Blocked,
+    };
+}
+
+fn handleBlockingXread(
+    allocator: std.mem.Allocator,
+    handler: *AppHandler,
+    connection: *ClientConnection,
+    command_parts: [64]?[]const u8,
+) !ProcessResult {
+    const xread_result = try handlers.handleXread(allocator, handler, connection, command_parts);
+    return switch (xread_result) {
         .Value => |reply| makeImmediate(try renderReply(allocator, reply), null),
         .Blocked => ProcessResult.Blocked,
     };
@@ -74,9 +89,13 @@ fn processImmediateCommand(
         .LLEN => try handlers.handleLlen(handler, command_parts),
         .LPOP => try handlers.handleLpop(allocator, handler, command_parts),
         .BLPOP => unreachable,
-        .XADD => try handlers.handleXadd(allocator, handler, command_parts),
+        .XADD => blk: {
+            const out = try handlers.handleXadd(allocator, handler, command_parts);
+            try appendNotify(&notify_acc, out.notify);
+            break :blk out.reply;
+        },
         .XRANGE => try handlers.handleXrange(allocator, handler, command_parts),
-        .XREAD => try handlers.handleXread(allocator, handler, command_parts),
+        .XREAD => unreachable,
     };
 
     const notify_slice: ?[]WriteOp = if (notify_acc.items.len != 0)

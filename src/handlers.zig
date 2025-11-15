@@ -74,32 +74,32 @@ fn streamReadResultReply(allocator: std.mem.Allocator, key: []const u8, entries:
     return Reply{ .Array = stream_pair };
 }
 
-const StreamReadRequest = struct {
-    key: []const u8,
-    id: []const u8,
-};
-
 const BlpopRequest = struct {
     key: []const u8,
     timeout_secs: f64,
 };
 
-fn parseXreadRequests(allocator: std.mem.Allocator, args: [64]?[]const u8) ![]StreamReadRequest {
-    const total_args = argumentCount(args);
-    if (total_args < 4) return error.ArgNum;
+pub const StreamReadRequest = struct {
+    key: []const u8,
+    id: []const u8,
+};
 
-    const streams_token = args[1] orelse return error.ArgNum;
+fn parseXreadRequests(allocator: std.mem.Allocator, args: [64]?[]const u8, streams_index: usize) ![]StreamReadRequest {
+    const total_args = argumentCount(args);
+    if (streams_index >= total_args) return error.ArgNum;
+
+    const streams_token = args[streams_index] orelse return error.ArgNum;
     if (!std.ascii.eqlIgnoreCase(streams_token, "STREAMS")) {
         return error.Syntax;
     }
 
-    const remaining = total_args - 2;
+    const remaining = total_args - (streams_index + 1);
     if (remaining == 0 or (remaining % 2 != 0)) {
         return error.ArgNum;
     }
 
     const stream_count = remaining / 2;
-    const keys_start: usize = 2;
+    const keys_start: usize = streams_index + 1;
     const ids_start = keys_start + stream_count;
 
     var requests = try allocator.alloc(StreamReadRequest, stream_count);
@@ -114,6 +114,34 @@ fn parseXreadRequests(allocator: std.mem.Allocator, args: [64]?[]const u8) ![]St
     }
 
     return requests;
+}
+
+const ParsedXread = struct {
+    block_ms: ?u64,
+    requests: []StreamReadRequest,
+};
+
+fn parseXreadArguments(allocator: std.mem.Allocator, args: [64]?[]const u8) !ParsedXread {
+    const total_args = argumentCount(args);
+    if (total_args < 4) return error.ArgNum;
+
+    var idx: usize = 1;
+    var block_ms: ?u64 = null;
+
+    if (idx < total_args) {
+        const token = args[idx] orelse return error.ArgNum;
+        if (std.ascii.eqlIgnoreCase(token, "BLOCK")) {
+            const timeout_slice = args[idx + 1] orelse return error.ArgNum;
+            block_ms = std.fmt.parseInt(u64, timeout_slice, 10) catch return error.NotInteger;
+            idx += 2;
+        }
+    }
+
+    const requests = try parseXreadRequests(allocator, args, idx);
+    return ParsedXread{
+        .block_ms = block_ms,
+        .requests = requests,
+    };
 }
 
 fn readStreamsIntoReplies(allocator: std.mem.Allocator, handler: *AppHandler, requests: []const StreamReadRequest) !?[]Reply {
@@ -143,6 +171,66 @@ fn readStreamsIntoReplies(allocator: std.mem.Allocator, handler: *AppHandler, re
     }
 
     return try streams_reply.toOwnedSlice();
+}
+
+fn replyToBytes(allocator: std.mem.Allocator, reply: Reply) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    try format.writeReply(buf.writer(), reply);
+    return try buf.toOwnedSlice();
+}
+
+fn tryResumeXreadConnection(
+    allocator: std.mem.Allocator,
+    handler: *AppHandler,
+    connection: *ClientConnection,
+) !?[]u8 {
+    const block_state = connection.blocking_stream_state orelse return null;
+
+    const stream_replies = readStreamsIntoReplies(allocator, handler, block_state.requests) catch |err| {
+        handler.clearStreamBlockingState(connection);
+        const reply = switch (err) {
+            error.WrongType => wrongTypeReply(),
+            error.Syntax => Reply{ .Error = .{ .kind = ErrorKind.Syntax } },
+            else => return err,
+        };
+        return try replyToBytes(allocator, reply);
+    };
+
+    if (stream_replies == null) return null;
+
+    const bytes = try replyToBytes(allocator, Reply{ .Array = stream_replies });
+    handler.clearStreamBlockingState(connection);
+    return bytes;
+}
+
+fn notifyStreamWaiters(allocator: std.mem.Allocator, handler: *AppHandler, key: []const u8) ![]WriteOp {
+    const wait_list_ptr = handler.blocked_stream_clients_by_key.getPtr(key) orelse return &.{};
+
+    var notifications = std.ArrayList(WriteOp).init(allocator);
+    errdefer notifications.deinit();
+
+    var node_ptr_opt = wait_list_ptr.first;
+    while (node_ptr_opt) |node_ptr| {
+        const next = node_ptr.next;
+
+        const fd = node_ptr.data;
+        if (handler.connection_by_fd.getPtr(fd)) |connection| {
+            if (try tryResumeXreadConnection(allocator, handler, connection)) |bytes| {
+                try notifications.append(.{ .fd = fd, .bytes = bytes });
+            }
+        } else {
+            wait_list_ptr.remove(node_ptr);
+            handler.app_allocator.destroy(node_ptr);
+        }
+
+        node_ptr_opt = next;
+    }
+
+    if (notifications.items.len == 0) {
+        return &.{};
+    }
+    return try notifications.toOwnedSlice();
 }
 
 fn parseBlpopRequest(args: [64]?[]const u8) !BlpopRequest {
@@ -324,17 +412,17 @@ pub fn handleLpop(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]
     };
 }
 
-pub fn handleXadd(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !Reply {
-    const key = args[1] orelse return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
-    const entry_id = args[2] orelse return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
+pub fn handleXadd(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !CommandOutcome {
+    const key = args[1] orelse return .{ .reply = Reply{ .Error = .{ .kind = ErrorKind.ArgNum } }, .notify = &.{} };
+    const entry_id = args[2] orelse return .{ .reply = Reply{ .Error = .{ .kind = ErrorKind.ArgNum } }, .notify = &.{} };
 
-    if (handler.string_store.contains(key)) return wrongTypeReply();
-    if (handler.list_store.contains(key)) return wrongTypeReply();
+    if (handler.string_store.contains(key)) return .{ .reply = wrongTypeReply(), .notify = &.{} };
+    if (handler.list_store.contains(key)) return .{ .reply = wrongTypeReply(), .notify = &.{} };
 
     const arg_count = argumentCount(args);
-    if (arg_count < 5) return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
+    if (arg_count < 5) return .{ .reply = Reply{ .Error = .{ .kind = ErrorKind.ArgNum } }, .notify = &.{} };
     const field_value_count = arg_count - 3;
-    if ((field_value_count % 2) != 0) return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
+    if ((field_value_count % 2) != 0) return .{ .reply = Reply{ .Error = .{ .kind = ErrorKind.ArgNum } }, .notify = &.{} };
 
     var pairs = std.ArrayList(db.StreamFieldValue).init(allocator);
     defer pairs.deinit();
@@ -346,18 +434,23 @@ pub fn handleXadd(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]
         try pairs.append(.{ .field = field, .value = value });
     }
 
-    if (pairs.items.len == 0) return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
+    if (pairs.items.len == 0) return .{ .reply = Reply{ .Error = .{ .kind = ErrorKind.ArgNum } }, .notify = &.{} };
 
     const stored_entry_id = handler.stream_store.addEntry(allocator, key, entry_id, pairs.items) catch |err| {
-        return switch (err) {
+        return .{ .reply = switch (err) {
             error.EntryIdTooSmall => Reply{ .Error = .{ .kind = ErrorKind.XaddIdTooSmall } },
             error.EntryIdZero => Reply{ .Error = .{ .kind = ErrorKind.XaddIdNotGreaterThanZero } },
             error.InvalidEntryId => Reply{ .Error = .{ .kind = ErrorKind.Syntax } },
             else => return err,
-        };
+        }, .notify = &.{} };
     };
 
-    return Reply{ .BulkString = stored_entry_id };
+    const notify = try notifyStreamWaiters(allocator, handler, key);
+
+    return .{
+        .reply = Reply{ .BulkString = stored_entry_id },
+        .notify = notify,
+    };
 }
 
 pub fn handleXrange(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !Reply {
@@ -379,24 +472,40 @@ pub fn handleXrange(allocator: std.mem.Allocator, handler: *AppHandler, args: [6
     return Reply{ .Array = outer };
 }
 
-pub fn handleXread(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !Reply {
-    const requests = parseXreadRequests(allocator, args) catch |err| {
-        return switch (err) {
+pub fn handleXread(
+    allocator: std.mem.Allocator,
+    handler: *AppHandler,
+    client_connection: *ClientConnection,
+    args: [64]?[]const u8,
+) !union(enum) { Value: Reply, Blocked } {
+    const parsed = parseXreadArguments(allocator, args) catch |err| {
+        return .{ .Value = switch (err) {
             error.ArgNum => Reply{ .Error = .{ .kind = ErrorKind.ArgNum } },
             error.Syntax => Reply{ .Error = .{ .kind = ErrorKind.Syntax } },
+            error.NotInteger => Reply{ .Error = .{ .kind = ErrorKind.NotInteger } },
             else => return err,
-        };
+        } };
     };
-    defer allocator.free(requests);
+    defer allocator.free(parsed.requests);
 
-    const stream_replies = readStreamsIntoReplies(allocator, handler, requests) catch |err| {
-        return switch (err) {
+    const stream_replies = readStreamsIntoReplies(allocator, handler, parsed.requests) catch |err| {
+        return .{ .Value = switch (err) {
             error.WrongType => wrongTypeReply(),
             error.Syntax => Reply{ .Error = .{ .kind = ErrorKind.Syntax } },
             else => return err,
-        };
+        } };
     };
-    return Reply{ .Array = stream_replies };
+
+    if (stream_replies) |replies| {
+        return .{ .Value = Reply{ .Array = replies } };
+    }
+
+    if (parsed.block_ms != null) {
+        try handler.registerStreamBlockingClient(client_connection, parsed.requests, parsed.block_ms);
+        return .Blocked;
+    }
+
+    return .{ .Value = Reply{ .Array = null } };
 }
 
 pub fn handleBlpop(allocator: std.mem.Allocator, handler: *AppHandler, client_connection: *ClientConnection, args: [64]?[]const u8) !union(enum) { Value: Reply, Blocked } {

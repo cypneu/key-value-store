@@ -6,6 +6,7 @@ const format = @import("resp/format.zig");
 const Reply = @import("reply.zig").Reply;
 const Order = std.math.Order;
 const StreamParser = @import("resp/stream_parser.zig").StreamParser;
+const StreamReadRequest = @import("handlers.zig").StreamReadRequest;
 
 pub const WriteOp = struct {
     fd: std.posix.fd_t,
@@ -23,10 +24,23 @@ pub const ClientConnection = struct {
     blocking_key: ?[]const u8,
     blocking_node: ?*std.DoublyLinkedList(posix.fd_t).Node,
     deadline_us: ?i64,
+    blocking_stream_state: ?StreamBlockingState,
 
     read_buffer: std.ArrayList(u8),
     read_start: usize,
     parser: StreamParser,
+};
+
+const StreamWaitList = std.DoublyLinkedList(posix.fd_t);
+
+const StreamRegistration = struct {
+    key: []const u8,
+    node: *StreamWaitList.Node,
+};
+
+const StreamBlockingState = struct {
+    requests: []StreamReadRequest,
+    registrations: []StreamRegistration,
 };
 
 pub const AppHandler = struct {
@@ -37,6 +51,7 @@ pub const AppHandler = struct {
 
     connection_by_fd: std.hash_map.AutoHashMap(posix.fd_t, ClientConnection),
     blocked_clients_by_key: std.hash_map.StringHashMap(std.DoublyLinkedList(posix.fd_t)),
+    blocked_stream_clients_by_key: std.hash_map.StringHashMap(StreamWaitList),
 
     timeouts: TimeoutQueue,
 
@@ -59,6 +74,7 @@ pub const AppHandler = struct {
     ) AppHandler {
         const connection_by_fd = std.hash_map.AutoHashMap(posix.fd_t, ClientConnection).init(allocator);
         const blocked_clients_by_key = std.hash_map.StringHashMap(std.DoublyLinkedList(posix.fd_t)).init(allocator);
+        const blocked_stream_clients_by_key = std.hash_map.StringHashMap(StreamWaitList).init(allocator);
         const timeouts = TimeoutQueue.init(allocator, {});
 
         return .{
@@ -68,6 +84,7 @@ pub const AppHandler = struct {
             .stream_store = stream_store,
             .connection_by_fd = connection_by_fd,
             .blocked_clients_by_key = blocked_clients_by_key,
+            .blocked_stream_clients_by_key = blocked_stream_clients_by_key,
             .timeouts = timeouts,
         };
     }
@@ -82,6 +99,11 @@ pub const AppHandler = struct {
             self.app_allocator.free(entry.key_ptr.*);
         }
         self.blocked_clients_by_key.deinit();
+        var stream_it = self.blocked_stream_clients_by_key.iterator();
+        while (stream_it.next()) |entry| {
+            self.app_allocator.free(entry.key_ptr.*);
+        }
+        self.blocked_stream_clients_by_key.deinit();
 
         self.connection_by_fd.deinit();
         self.timeouts.deinit();
@@ -134,6 +156,7 @@ pub const AppHandler = struct {
             .blocking_key = null,
             .blocking_node = null,
             .deadline_us = null,
+            .blocking_stream_state = null,
             .read_buffer = std.ArrayList(u8).init(self.app_allocator),
             .read_start = 0,
             .parser = StreamParser.init(),
@@ -149,7 +172,116 @@ pub const AppHandler = struct {
                 wait_list.remove(node_ptr);
                 self.app_allocator.destroy(node_ptr);
             }
+            self.cleanupStreamBlockingState(removed_connection.value.blocking_stream_state);
         }
+    }
+
+    fn cleanupStreamBlockingState(self: *AppHandler, maybe_state: ?StreamBlockingState) void {
+        if (maybe_state) |state| {
+            for (state.registrations) |registration| {
+                if (self.blocked_stream_clients_by_key.getPtr(registration.key)) |wait_list| {
+                    wait_list.remove(registration.node);
+                }
+                self.app_allocator.destroy(registration.node);
+            }
+
+            for (state.requests) |request| {
+                self.app_allocator.free(request.id);
+            }
+
+            self.app_allocator.free(state.registrations);
+            self.app_allocator.free(state.requests);
+        }
+    }
+
+    pub fn clearStreamBlockingState(self: *AppHandler, conn: *ClientConnection) void {
+        self.cleanupStreamBlockingState(conn.blocking_stream_state);
+        conn.blocking_stream_state = null;
+        conn.deadline_us = null;
+    }
+
+    fn ensureStreamWaitList(self: *AppHandler, key: []const u8) !struct {
+        key: []const u8,
+        wait_list: *StreamWaitList,
+    } {
+        const gop = try self.blocked_stream_clients_by_key.getOrPut(key);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.app_allocator.dupe(u8, key);
+            gop.value_ptr.* = .{};
+        }
+        return .{ .key = gop.key_ptr.*, .wait_list = gop.value_ptr };
+    }
+
+    fn cleanupStreamSlices(self: *AppHandler, requests: []StreamReadRequest, registrations: []StreamRegistration) void {
+        for (registrations) |registration| {
+            if (self.blocked_stream_clients_by_key.getPtr(registration.key)) |wait_list| {
+                wait_list.remove(registration.node);
+            }
+            self.app_allocator.destroy(registration.node);
+        }
+
+        for (requests) |request| {
+            self.app_allocator.free(request.id);
+        }
+    }
+
+    fn createStreamBlockingState(self: *AppHandler, connection: *ClientConnection, requests: []const StreamReadRequest) !StreamBlockingState {
+        const count = requests.len;
+        const stored_requests = try self.app_allocator.alloc(StreamReadRequest, count);
+        errdefer self.app_allocator.free(stored_requests);
+
+        const registrations = try self.app_allocator.alloc(StreamRegistration, count);
+        errdefer self.app_allocator.free(registrations);
+
+        var created: usize = 0;
+        errdefer self.cleanupStreamSlices(stored_requests[0..created], registrations[0..created]);
+
+        for (requests, 0..) |request, idx| {
+            const wait = try self.ensureStreamWaitList(request.key);
+            const node_ptr = try self.app_allocator.create(StreamWaitList.Node);
+            node_ptr.* = .{ .data = connection.fd };
+            wait.wait_list.append(node_ptr);
+
+            stored_requests[idx] = .{
+                .key = wait.key,
+                .id = try self.app_allocator.dupe(u8, request.id),
+            };
+            registrations[idx] = .{ .key = wait.key, .node = node_ptr };
+            created = idx + 1;
+        }
+
+        return .{ .requests = stored_requests, .registrations = registrations };
+    }
+
+    fn setStreamBlockDeadline(self: *AppHandler, connection: *ClientConnection, block_ms: ?u64) !void {
+        if (block_ms) |ms| {
+            if (ms == 0) {
+                connection.deadline_us = null;
+                return;
+            }
+            const now_us: i64 = std.time.microTimestamp();
+            const delta_us: i64 = @intCast(ms * @as(u64, std.time.us_per_ms));
+            const deadline_us = now_us + delta_us;
+            connection.deadline_us = deadline_us;
+            try self.timeouts.add(.{ .deadline_us = deadline_us, .fd = connection.fd });
+        } else {
+            connection.deadline_us = null;
+        }
+    }
+
+    pub fn registerStreamBlockingClient(
+        self: *AppHandler,
+        connection: *ClientConnection,
+        requests: []const StreamReadRequest,
+        block_ms: ?u64,
+    ) !void {
+        const state = try self.createStreamBlockingState(connection, requests);
+        errdefer self.cleanupStreamBlockingState(state);
+
+        connection.blocking_stream_state = state;
+        connection.blocking_key = null;
+        connection.blocking_node = null;
+        try self.setStreamBlockDeadline(connection, block_ms);
     }
 
     pub fn drainWaitersForKey(self: *AppHandler, request_allocator: std.mem.Allocator, key: []const u8, pushed: usize) ![]WriteOp {
@@ -219,6 +351,12 @@ pub const AppHandler = struct {
                     try format.writeReply(buf.writer(), Reply{ .Array = null });
                     const bytes = try buf.toOwnedSlice();
                     try notifications.append(.{ .fd = fd, .bytes = bytes });
+                } else if (conn.blocking_stream_state != null) {
+                    var buf = std.ArrayList(u8).init(request_allocator);
+                    try format.writeReply(buf.writer(), Reply{ .Array = null });
+                    const bytes = try buf.toOwnedSlice();
+                    try notifications.append(.{ .fd = fd, .bytes = bytes });
+                    self.clearStreamBlockingState(conn);
                 }
             }
         }

@@ -1,3 +1,6 @@
+import queue
+import socket
+import threading
 import time
 
 import pytest
@@ -50,7 +53,9 @@ def test_xadd_rejects_non_incrementing_id(conn, make_key):
 def test_xadd_rejects_zero_id(conn, make_key):
     key = make_key("stream_zero_id")
 
-    with pytest.raises(RuntimeError, match="ERR The ID specified in XADD must be greater than 0-0"):
+    with pytest.raises(
+        RuntimeError, match="ERR The ID specified in XADD must be greater than 0-0"
+    ):
         exec_command(conn, "XADD", key, "0-0", "sensor", "value")
 
 
@@ -163,3 +168,128 @@ def test_xread_multiple_streams(conn, make_key):
             ],
         ],
     ]
+
+
+def test_xread_block_returns_entry(server_proc, make_key):
+    key = make_key("stream_xread_block")
+    replies = queue.Queue()
+
+    with socket.create_connection(("127.0.0.1", 6379), timeout=2.0) as seed_conn:
+        assert exec_command(seed_conn, "XADD", key, "0-1", "temperature", "96") == "0-1"
+
+    def reader():
+        with socket.create_connection(("127.0.0.1", 6379), timeout=2.0) as sock:
+            replies.put(
+                exec_command(sock, "XREAD", "BLOCK", "1000", "STREAMS", key, "0-1")
+            )
+
+    worker = threading.Thread(target=reader)
+    worker.start()
+
+    time.sleep(0.05)
+    with socket.create_connection(("127.0.0.1", 6379), timeout=2.0) as writer:
+        assert exec_command(writer, "XADD", key, "0-2", "temperature", "95") == "0-2"
+
+    worker.join(timeout=2.0)
+    assert not worker.is_alive(), "XREAD worker did not finish in time"
+
+    assert replies.get_nowait() == [
+        [
+            key,
+            [
+                ["0-2", ["temperature", "95"]],
+            ],
+        ]
+    ]
+
+
+def test_xread_block_multiple_keys_returns_single_stream(server_proc, make_key):
+    key1 = make_key("stream_xread_block_multi_1")
+    key2 = make_key("stream_xread_block_multi_2")
+    replies = queue.Queue()
+
+    with socket.create_connection(("127.0.0.1", 6379), timeout=2.0) as seed_conn:
+        assert exec_command(seed_conn, "XADD", key1, "0-1", "sensor", "a") == "0-1"
+        assert exec_command(seed_conn, "XADD", key2, "0-1", "sensor", "b") == "0-1"
+
+    def reader():
+        with socket.create_connection(("127.0.0.1", 6379), timeout=2.0) as sock:
+            replies.put(
+                exec_command(
+                    sock, "XREAD", "BLOCK", "1000", "STREAMS", key1, key2, "0-1", "0-1"
+                )
+            )
+
+    worker = threading.Thread(target=reader)
+    worker.start()
+
+    time.sleep(0.05)
+    with socket.create_connection(("127.0.0.1", 6379), timeout=2.0) as writer:
+        assert exec_command(writer, "XADD", key2, "0-2", "sensor", "c") == "0-2"
+
+    worker.join(timeout=2.0)
+    assert not worker.is_alive(), "XREAD worker did not finish in time"
+    assert replies.get_nowait() == [
+        [
+            key2,
+            [
+                ["0-2", ["sensor", "c"]],
+            ],
+        ]
+    ]
+
+
+def test_xread_block_zero_waits_indefinitely(server_proc, make_key):
+    key = make_key("stream_xread_block_forever")
+    replies = queue.Queue()
+
+    with socket.create_connection(("127.0.0.1", 6379), timeout=2.0) as seed_conn:
+        assert exec_command(seed_conn, "XADD", key, "0-1", "sensor", "1") == "0-1"
+
+    def reader():
+        with socket.create_connection(("127.0.0.1", 6379), timeout=2.0) as sock:
+            replies.put(
+                exec_command(sock, "XREAD", "BLOCK", "0", "STREAMS", key, "0-1")
+            )
+
+    worker = threading.Thread(target=reader)
+    worker.start()
+
+    time.sleep(0.3)
+    assert worker.is_alive(), "XREAD BLOCK 0 should still be waiting"
+
+    with socket.create_connection(("127.0.0.1", 6379), timeout=2.0) as writer:
+        assert exec_command(writer, "XADD", key, "0-2", "sensor", "2") == "0-2"
+
+    worker.join(timeout=2.0)
+    assert not worker.is_alive(), "XREAD worker did not finish in time"
+
+    assert replies.get_nowait() == [
+        [
+            key,
+            [
+                ["0-2", ["sensor", "2"]],
+            ],
+        ]
+    ]
+
+
+def test_xread_block_timeout_returns_null(server_proc, make_key):
+    key = make_key("stream_xread_block_timeout")
+    replies = queue.Queue()
+
+    with socket.create_connection(("127.0.0.1", 6379), timeout=2.0) as seed_conn:
+        assert exec_command(seed_conn, "XADD", key, "0-1", "temperature", "93") == "0-1"
+
+    def reader():
+        with socket.create_connection(("127.0.0.1", 6379), timeout=2.0) as sock:
+            replies.put(
+                exec_command(sock, "XREAD", "BLOCK", "200", "STREAMS", key, "0-1")
+            )
+
+    worker = threading.Thread(target=reader)
+    worker.start()
+
+    worker.join(timeout=2.0)
+    assert not worker.is_alive(), "XREAD worker did not finish in time"
+    assert replies.get_nowait() is None
