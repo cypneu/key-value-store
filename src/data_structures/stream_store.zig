@@ -523,6 +523,12 @@ pub const StreamStore = struct {
         return entries[idx..];
     }
 
+    pub fn formatLastEntryId(self: *StreamStore, key: []const u8, buffer: []u8) !?[]const u8 {
+        const stream_ptr = self.data.getPtr(key) orelse return null;
+        const last_id = stream_ptr.last_id orelse return null;
+        return try last_id.format(buffer);
+    }
+
     pub fn contains(self: *StreamStore, key: []const u8) bool {
         return self.data.get(key) != null;
     }

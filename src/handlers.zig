@@ -84,6 +84,32 @@ pub const StreamReadRequest = struct {
     id: []const u8,
 };
 
+fn isLatestStreamId(id: []const u8) bool {
+    return id.len == 1 and id[0] == '$';
+}
+
+fn latestStreamIdSnapshot(allocator: std.mem.Allocator, handler: *AppHandler, key: []const u8) ![]u8 {
+    var id_buffer: [64]u8 = undefined;
+    if (try handler.stream_store.formatLastEntryId(key, id_buffer[0..])) |formatted| {
+        return try allocator.dupe(u8, formatted);
+    }
+    return try allocator.dupe(u8, "0-0");
+}
+
+fn resolveLatestStreamIds(
+    allocator: std.mem.Allocator,
+    handler: *AppHandler,
+    requests: []StreamReadRequest,
+    replacements: *std.ArrayList([]u8),
+) !void {
+    for (requests, 0..) |request, idx| {
+        if (!isLatestStreamId(request.id)) continue;
+        const snapshot = try latestStreamIdSnapshot(allocator, handler, request.key);
+        try replacements.append(snapshot);
+        requests[idx].id = snapshot;
+    }
+}
+
 fn parseXreadRequests(allocator: std.mem.Allocator, args: [64]?[]const u8, streams_index: usize) ![]StreamReadRequest {
     const total_args = argumentCount(args);
     if (streams_index >= total_args) return error.ArgNum;
@@ -487,6 +513,15 @@ pub fn handleXread(
         } };
     };
     defer allocator.free(parsed.requests);
+
+    var latest_id_allocs = std.ArrayList([]u8).init(allocator);
+    defer {
+        for (latest_id_allocs.items) |snapshot| {
+            allocator.free(snapshot);
+        }
+        latest_id_allocs.deinit();
+    }
+    try resolveLatestStreamIds(allocator, handler, parsed.requests, &latest_id_allocs);
 
     const stream_replies = readStreamsIntoReplies(allocator, handler, parsed.requests) catch |err| {
         return .{ .Value = switch (err) {
