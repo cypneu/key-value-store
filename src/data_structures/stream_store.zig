@@ -506,6 +506,23 @@ pub const StreamStore = struct {
         return try stream_ptr.xrange(allocator, start_key, end_key);
     }
 
+    pub fn xread(self: *StreamStore, allocator: std.mem.Allocator, key: []const u8, start: []const u8) ![]*const StreamEntry {
+        const stream_ptr = self.data.getPtr(key) orelse return &[_]*const StreamEntry{};
+
+        const start_id = EntryId.parse(start) catch return error.InvalidRangeId;
+        const start_key = entryKeyFromId(start_id);
+        const end_id = EntryId{ .milliseconds = std.math.maxInt(u64), .sequence = std.math.maxInt(u64) };
+        const end_key = entryKeyFromId(end_id);
+
+        const entries = try stream_ptr.xrange(allocator, start_key, end_key);
+        var idx: usize = 0;
+        while (idx < entries.len) : (idx += 1) {
+            if (entries[idx].*.id.isGreaterThan(start_id)) break;
+        }
+
+        return entries[idx..];
+    }
+
     pub fn contains(self: *StreamStore, key: []const u8) bool {
         return self.data.get(key) != null;
     }

@@ -51,6 +51,95 @@ fn streamEntryFieldsReply(allocator: std.mem.Allocator, fields: []const db.Strea
     return Reply{ .Array = arr };
 }
 
+fn streamEntriesReply(allocator: std.mem.Allocator, entries: []*const db.StreamEntry) ![]Reply {
+    var outer = try allocator.alloc(Reply, entries.len);
+    for (entries, 0..) |entry_ptr, idx| {
+        const entry = entry_ptr.*;
+        var entry_reply = try allocator.alloc(Reply, 2);
+        var id_buf: [64]u8 = undefined;
+        const id_slice = try entry.id.format(id_buf[0..]);
+        const id_copy = try allocator.dupe(u8, id_slice);
+        entry_reply[0] = Reply{ .BulkString = id_copy };
+        entry_reply[1] = try streamEntryFieldsReply(allocator, entry.fields);
+        outer[idx] = Reply{ .Array = entry_reply };
+    }
+    return outer;
+}
+
+fn streamReadResultReply(allocator: std.mem.Allocator, key: []const u8, entries: []*const db.StreamEntry) !Reply {
+    const entry_reply = try streamEntriesReply(allocator, entries);
+    var stream_pair = try allocator.alloc(Reply, 2);
+    stream_pair[0] = Reply{ .BulkString = try allocator.dupe(u8, key) };
+    stream_pair[1] = Reply{ .Array = entry_reply };
+    return Reply{ .Array = stream_pair };
+}
+
+const StreamReadRequest = struct {
+    key: []const u8,
+    id: []const u8,
+};
+
+fn parseXreadRequests(allocator: std.mem.Allocator, args: [64]?[]const u8) ![]StreamReadRequest {
+    const total_args = argumentCount(args);
+    if (total_args < 4) return error.ArgNum;
+
+    const streams_token = args[1] orelse return error.ArgNum;
+    if (!std.ascii.eqlIgnoreCase(streams_token, "STREAMS")) {
+        return error.Syntax;
+    }
+
+    const remaining = total_args - 2;
+    if (remaining == 0 or (remaining % 2 != 0)) {
+        return error.ArgNum;
+    }
+
+    const stream_count = remaining / 2;
+    const keys_start: usize = 2;
+    const ids_start = keys_start + stream_count;
+
+    var requests = try allocator.alloc(StreamReadRequest, stream_count);
+    errdefer allocator.free(requests);
+
+    var idx: usize = 0;
+    while (idx < stream_count) : (idx += 1) {
+        requests[idx] = .{
+            .key = args[keys_start + idx] orelse return error.ArgNum,
+            .id = args[ids_start + idx] orelse return error.ArgNum,
+        };
+    }
+
+    return requests;
+}
+
+fn readStreamsIntoReplies(allocator: std.mem.Allocator, handler: *AppHandler, requests: []const StreamReadRequest) !?[]Reply {
+    var streams_reply = std.ArrayList(Reply).init(allocator);
+    defer streams_reply.deinit();
+
+    for (requests) |req| {
+        if (handler.string_store.contains(req.key) or handler.list_store.contains(req.key)) {
+            return error.WrongType;
+        }
+
+        const entries = handler.stream_store.xread(allocator, req.key, req.id) catch |err| {
+            return switch (err) {
+                error.InvalidRangeId => error.Syntax,
+                else => err,
+            };
+        };
+
+        if (entries.len == 0) continue;
+
+        const stream_reply = try streamReadResultReply(allocator, req.key, entries);
+        try streams_reply.append(stream_reply);
+    }
+
+    if (streams_reply.items.len == 0) {
+        return null;
+    }
+
+    return try streams_reply.toOwnedSlice();
+}
+
 fn argumentCount(args: [64]?[]const u8) usize {
     var count: usize = 0;
     while (count < args.len) : (count += 1) {
@@ -64,29 +153,19 @@ pub fn handleEcho(args: [64]?[]const u8) !Reply {
     return Reply{ .BulkString = content };
 }
 
-pub fn handleGet(
-    string_store: *db.StringStore,
-    list_store: *db.ListStore,
-    stream_store: *db.StreamStore,
-    args: [64]?[]const u8,
-) !Reply {
+pub fn handleGet(handler: *AppHandler, args: [64]?[]const u8) !Reply {
     const key = args[1] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
-    if (list_store.contains(key)) return wrongTypeReply();
-    if (stream_store.contains(key)) return wrongTypeReply();
-    return Reply{ .BulkString = string_store.get(key) };
+    if (handler.list_store.contains(key)) return wrongTypeReply();
+    if (handler.stream_store.contains(key)) return wrongTypeReply();
+    return Reply{ .BulkString = handler.string_store.get(key) };
 }
 
-pub fn handleType(
-    string_store: *db.StringStore,
-    list_store: *db.ListStore,
-    stream_store: *db.StreamStore,
-    args: [64]?[]const u8,
-) !Reply {
+pub fn handleType(handler: *AppHandler, args: [64]?[]const u8) !Reply {
     const key = args[1] orelse return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
 
-    if (string_store.contains(key)) return Reply{ .SimpleString = "string" };
-    if (list_store.contains(key)) return Reply{ .SimpleString = "list" };
-    if (stream_store.contains(key)) return Reply{ .SimpleString = "stream" };
+    if (handler.string_store.contains(key)) return Reply{ .SimpleString = "string" };
+    if (handler.list_store.contains(key)) return Reply{ .SimpleString = "list" };
+    if (handler.stream_store.contains(key)) return Reply{ .SimpleString = "stream" };
 
     return Reply{ .SimpleString = "none" };
 }
@@ -97,12 +176,7 @@ fn calculateExpiration(ttl_ms: u64) i64 {
     return current_micros + ttl_us;
 }
 
-pub fn handleSet(
-    string_store: *db.StringStore,
-    list_store: *db.ListStore,
-    stream_store: *db.StreamStore,
-    args: [64]?[]const u8,
-) !Reply {
+pub fn handleSet(handler: *AppHandler, args: [64]?[]const u8) !Reply {
     const key = args[1] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
     const value_slice = args[2] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
     const px_command = args[3] orelse "";
@@ -114,10 +188,10 @@ pub fn handleSet(
         expiration_us = calculateExpiration(px_value_ms);
     }
 
-    list_store.delete(key);
-    stream_store.delete(key);
+    handler.list_store.delete(key);
+    handler.stream_store.delete(key);
 
-    try string_store.set(key, value_slice, expiration_us);
+    try handler.string_store.set(key, value_slice, expiration_us);
     return .{ .SimpleString = "OK" };
 }
 
@@ -152,13 +226,7 @@ fn handlePush(comptime is_left: bool, allocator: std.mem.Allocator, handler: *Ap
     };
 }
 
-pub fn handleLrange(
-    allocator: std.mem.Allocator,
-    string_store: *db.StringStore,
-    list_store: *db.ListStore,
-    stream_store: *db.StreamStore,
-    args: [64]?[]const u8,
-) !Reply {
+pub fn handleLrange(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !Reply {
     const key = args[1] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
     const start_index_slice = args[2] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
     const end_index_slice = args[3] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
@@ -166,41 +234,30 @@ pub fn handleLrange(
     const start_index = std.fmt.parseInt(i64, start_index_slice, 10) catch return .{ .Error = .{ .kind = ErrorKind.NotInteger } };
     const end_index = std.fmt.parseInt(i64, end_index_slice, 10) catch return .{ .Error = .{ .kind = ErrorKind.NotInteger } };
 
-    if (string_store.contains(key)) return wrongTypeReply();
-    if (stream_store.contains(key)) return wrongTypeReply();
+    if (handler.string_store.contains(key)) return wrongTypeReply();
+    if (handler.stream_store.contains(key)) return wrongTypeReply();
 
-    const range_view = list_store.lrange(key, start_index, end_index);
+    const range_view = handler.list_store.lrange(key, start_index, end_index);
     return try stringArrayFromRangeView(allocator, range_view);
 }
 
-pub fn handleLlen(
-    string_store: *db.StringStore,
-    list_store: *db.ListStore,
-    stream_store: *db.StreamStore,
-    args: [64]?[]const u8,
-) !Reply {
+pub fn handleLlen(handler: *AppHandler, args: [64]?[]const u8) !Reply {
     const key = args[1] orelse return Reply{ .Error = .{ .kind = .ArgNum } };
-    if (string_store.contains(key)) return wrongTypeReply();
-    if (stream_store.contains(key)) return wrongTypeReply();
-    const length = list_store.length_by_key(key);
+    if (handler.string_store.contains(key)) return wrongTypeReply();
+    if (handler.stream_store.contains(key)) return wrongTypeReply();
+    const length = handler.list_store.length_by_key(key);
     return Reply{ .Integer = @intCast(length) };
 }
 
-pub fn handleLpop(
-    allocator: std.mem.Allocator,
-    string_store: *db.StringStore,
-    list_store: *db.ListStore,
-    stream_store: *db.StreamStore,
-    args: [64]?[]const u8,
-) !Reply {
+pub fn handleLpop(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !Reply {
     const key = args[1] orelse return Reply{ .Error = .{ .kind = .ArgNum } };
     const count_slice = args[2] orelse "1";
     const count = std.fmt.parseInt(u64, count_slice, 10) catch 1;
 
-    if (string_store.contains(key)) return wrongTypeReply();
-    if (stream_store.contains(key)) return wrongTypeReply();
+    if (handler.string_store.contains(key)) return wrongTypeReply();
+    if (handler.stream_store.contains(key)) return wrongTypeReply();
 
-    const popped_values = try list_store.lpop(key, count, allocator);
+    const popped_values = try handler.list_store.lpop(key, count, allocator);
 
     return switch (popped_values.len) {
         0 => Reply{ .BulkString = null },
@@ -245,40 +302,43 @@ pub fn handleXadd(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]
     return Reply{ .BulkString = stored_entry_id };
 }
 
-pub fn handleXrange(
-    allocator: std.mem.Allocator,
-    string_store: *db.StringStore,
-    list_store: *db.ListStore,
-    stream_store: *db.StreamStore,
-    args: [64]?[]const u8,
-) !Reply {
+pub fn handleXrange(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !Reply {
     const key = args[1] orelse return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
     const start_id = args[2] orelse return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
     const end_id = args[3] orelse return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
 
-    if (string_store.contains(key)) return wrongTypeReply();
-    if (list_store.contains(key)) return wrongTypeReply();
+    if (handler.string_store.contains(key)) return wrongTypeReply();
+    if (handler.list_store.contains(key)) return wrongTypeReply();
 
-    const entries = stream_store.xrange(allocator, key, start_id, end_id) catch |err| {
+    const entries = handler.stream_store.xrange(allocator, key, start_id, end_id) catch |err| {
         return switch (err) {
             error.InvalidRangeId => Reply{ .Error = .{ .kind = ErrorKind.Syntax } },
             else => return err,
         };
     };
 
-    var outer = try allocator.alloc(Reply, entries.len);
-    for (entries, 0..) |entry_ptr, idx| {
-        const entry = entry_ptr.*;
-        var entry_reply = try allocator.alloc(Reply, 2);
-        var id_buf: [64]u8 = undefined;
-        const id_slice = try entry.id.format(id_buf[0..]);
-        const id_copy = try allocator.dupe(u8, id_slice);
-        entry_reply[0] = Reply{ .BulkString = id_copy };
-        entry_reply[1] = try streamEntryFieldsReply(allocator, entry.fields);
-        outer[idx] = Reply{ .Array = entry_reply };
-    }
-
+    const outer = try streamEntriesReply(allocator, entries);
     return Reply{ .Array = outer };
+}
+
+pub fn handleXread(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !Reply {
+    const requests = parseXreadRequests(allocator, args) catch |err| {
+        return switch (err) {
+            error.ArgNum => Reply{ .Error = .{ .kind = ErrorKind.ArgNum } },
+            error.Syntax => Reply{ .Error = .{ .kind = ErrorKind.Syntax } },
+            else => return err,
+        };
+    };
+    defer allocator.free(requests);
+
+    const stream_replies = readStreamsIntoReplies(allocator, handler, requests) catch |err| {
+        return switch (err) {
+            error.WrongType => wrongTypeReply(),
+            error.Syntax => Reply{ .Error = .{ .kind = ErrorKind.Syntax } },
+            else => return err,
+        };
+    };
+    return Reply{ .Array = stream_replies };
 }
 
 pub fn handleBlpop(allocator: std.mem.Allocator, handler: *AppHandler, client_connection: *ClientConnection, args: [64]?[]const u8) !union(enum) { Value: Reply, Blocked } {

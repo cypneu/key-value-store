@@ -114,3 +114,52 @@ def test_xrange_allows_plus_end(conn, make_key):
         ["0-2", ["bar", "baz"]],
         ["0-3", ["baz", "foo"]],
     ]
+
+
+def test_xread_returns_entries(conn, make_key):
+    key = make_key("stream_xread")
+
+    assert exec_command(conn, "XADD", key, "0-1", "foo", "bar") == "0-1"
+    assert exec_command(conn, "XADD", key, "0-2", "bar", "baz") == "0-2"
+    assert exec_command(conn, "XADD", key, "0-3", "baz", "foo") == "0-3"
+
+    assert exec_command(conn, "XREAD", "STREAMS", key, "0-1") == [
+        [
+            key,
+            [
+                ["0-2", ["bar", "baz"]],
+                ["0-3", ["baz", "foo"]],
+            ],
+        ]
+    ]
+
+
+def test_xread_returns_none_when_no_entries(conn, make_key):
+    key = make_key("stream_xread_empty")
+
+    assert exec_command(conn, "XADD", key, "0-1", "foo", "bar") == "0-1"
+
+    assert exec_command(conn, "XREAD", "STREAMS", key, "0-1") is None
+
+
+def test_xread_multiple_streams(conn, make_key):
+    key1 = make_key("stream_xread_multi1")
+    key2 = make_key("stream_xread_multi2")
+
+    assert exec_command(conn, "XADD", key1, "0-1", "temperature", "95") == "0-1"
+    assert exec_command(conn, "XADD", key2, "0-2", "humidity", "97") == "0-2"
+
+    assert exec_command(conn, "XREAD", "STREAMS", key1, key2, "0-0", "0-1") == [
+        [
+            key1,
+            [
+                ["0-1", ["temperature", "95"]],
+            ],
+        ],
+        [
+            key2,
+            [
+                ["0-2", ["humidity", "97"]],
+            ],
+        ],
+    ]
