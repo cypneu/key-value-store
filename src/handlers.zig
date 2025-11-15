@@ -79,6 +79,11 @@ const StreamReadRequest = struct {
     id: []const u8,
 };
 
+const BlpopRequest = struct {
+    key: []const u8,
+    timeout_secs: f64,
+};
+
 fn parseXreadRequests(allocator: std.mem.Allocator, args: [64]?[]const u8) ![]StreamReadRequest {
     const total_args = argumentCount(args);
     if (total_args < 4) return error.ArgNum;
@@ -138,6 +143,59 @@ fn readStreamsIntoReplies(allocator: std.mem.Allocator, handler: *AppHandler, re
     }
 
     return try streams_reply.toOwnedSlice();
+}
+
+fn parseBlpopRequest(args: [64]?[]const u8) !BlpopRequest {
+    const key = args[1] orelse return error.ArgNum;
+    const timeout_slice = args[2] orelse return error.ArgNum;
+
+    const timeout_secs = std.fmt.parseFloat(f64, timeout_slice) catch return error.NotInteger;
+    if (timeout_secs < 0) return error.NotInteger;
+
+    return BlpopRequest{ .key = key, .timeout_secs = timeout_secs };
+}
+
+fn ensureListOperationAllowed(handler: *AppHandler, key: []const u8) !void {
+    if (handler.string_store.contains(key) or handler.stream_store.contains(key)) {
+        return error.WrongType;
+    }
+}
+
+fn tryImmediateBlpop(allocator: std.mem.Allocator, handler: *AppHandler, key: []const u8) !?Reply {
+    const popped_values = try handler.list_store.lpop(key, 1, allocator);
+    if (popped_values.len == 0) return null;
+
+    var arr = try allocator.alloc(Reply, 2);
+    arr[0] = Reply{ .BulkString = key };
+    arr[1] = Reply{ .BulkString = popped_values[0] };
+    return Reply{ .Array = arr };
+}
+
+fn registerBlockingClient(handler: *AppHandler, client_connection: *ClientConnection, key: []const u8, timeout_secs: f64) !void {
+    var gop = try handler.blocked_clients_by_key.getOrPut(key);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = try handler.app_allocator.dupe(u8, key);
+        gop.value_ptr.* = .{};
+    }
+
+    const NodeType = std.DoublyLinkedList(std.posix.fd_t).Node;
+    const node_ptr = try handler.app_allocator.create(NodeType);
+    node_ptr.* = .{ .data = client_connection.fd };
+    gop.value_ptr.append(node_ptr);
+
+    client_connection.*.blocking_key = gop.key_ptr.*;
+    client_connection.*.blocking_node = node_ptr;
+
+    if (timeout_secs > 0) {
+        const now_us: i64 = std.time.microTimestamp();
+        const delta_us: i64 = @intFromFloat(timeout_secs * @as(f64, @floatFromInt(std.time.us_per_s)));
+        const deadline_us: i64 = now_us + delta_us;
+        client_connection.*.deadline_us = deadline_us;
+
+        try handler.timeouts.add(.{ .deadline_us = deadline_us, .fd = client_connection.fd });
+    } else {
+        client_connection.*.deadline_us = null;
+    }
 }
 
 fn argumentCount(args: [64]?[]const u8) usize {
@@ -342,52 +400,25 @@ pub fn handleXread(allocator: std.mem.Allocator, handler: *AppHandler, args: [64
 }
 
 pub fn handleBlpop(allocator: std.mem.Allocator, handler: *AppHandler, client_connection: *ClientConnection, args: [64]?[]const u8) !union(enum) { Value: Reply, Blocked } {
-    const key = args[1] orelse return .{ .Value = .{ .Error = .{ .kind = ErrorKind.ArgNum } } };
-    const timeout_slice = args[2] orelse return .{ .Value = .{ .Error = .{ .kind = ErrorKind.ArgNum } } };
+    const request = parseBlpopRequest(args) catch |err| {
+        return .{ .Value = switch (err) {
+            error.ArgNum => Reply{ .Error = .{ .kind = ErrorKind.ArgNum } },
+            error.NotInteger => Reply{ .Error = .{ .kind = ErrorKind.NotInteger } },
+            else => return err,
+        } };
+    };
 
-    const timeout_secs = std.fmt.parseFloat(f64, timeout_slice) catch return .{ .Value = .{ .Error = .{ .kind = ErrorKind.NotInteger } } };
-    if (timeout_secs < 0) return .{ .Value = .{ .Error = .{ .kind = ErrorKind.NotInteger } } };
+    ensureListOperationAllowed(handler, request.key) catch |err| {
+        return .{ .Value = switch (err) {
+            error.WrongType => wrongTypeReply(),
+            else => return err,
+        } };
+    };
 
-    if (handler.string_store.contains(key)) {
-        return .{ .Value = wrongTypeReply() };
+    if (try tryImmediateBlpop(allocator, handler, request.key)) |reply| {
+        return .{ .Value = reply };
     }
 
-    if (handler.stream_store.contains(key)) {
-        return .{ .Value = wrongTypeReply() };
-    }
-
-    const popped_values = try handler.list_store.lpop(key, 1, allocator);
-    if (popped_values.len > 0) {
-        var arr = try allocator.alloc(Reply, 2);
-        arr[0] = Reply{ .BulkString = key };
-        arr[1] = Reply{ .BulkString = popped_values[0] };
-        return .{ .Value = .{ .Array = arr } };
-    }
-
-    var gop = try handler.blocked_clients_by_key.getOrPut(key);
-    if (!gop.found_existing) {
-        gop.key_ptr.* = try handler.app_allocator.dupe(u8, key);
-        gop.value_ptr.* = .{};
-    }
-
-    const NodeType = std.DoublyLinkedList(std.posix.fd_t).Node;
-    const node_ptr = try handler.app_allocator.create(NodeType);
-    node_ptr.* = .{ .data = client_connection.fd };
-    gop.value_ptr.append(node_ptr);
-
-    client_connection.*.blocking_key = gop.key_ptr.*;
-    client_connection.*.blocking_node = node_ptr;
-
-    if (timeout_secs > 0) {
-        const now_us: i64 = std.time.microTimestamp();
-        const delta_us: i64 = @intFromFloat(timeout_secs * @as(f64, @floatFromInt(std.time.us_per_s)));
-        const deadline_us: i64 = now_us + delta_us;
-        client_connection.*.deadline_us = deadline_us;
-
-        try handler.timeouts.add(.{ .deadline_us = deadline_us, .fd = client_connection.fd });
-    } else {
-        client_connection.*.deadline_us = null;
-    }
-
+    try registerBlockingClient(handler, client_connection, request.key, request.timeout_secs);
     return .Blocked;
 }
