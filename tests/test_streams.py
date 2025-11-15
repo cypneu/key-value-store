@@ -75,3 +75,16 @@ def test_xadd_auto_generates_full_id(conn, make_key):
 
     assert start_ms <= ts_ms <= end_ms
     assert seq == 0
+
+
+def test_xrange_returns_entries(conn, make_key):
+    key = make_key("stream_xrange")
+
+    assert exec_command(conn, "XADD", key, "0-1", "foo", "bar") == "0-1"
+    assert exec_command(conn, "XADD", key, "0-2", "bar", "baz") == "0-2"
+    assert exec_command(conn, "XADD", key, "0-3", "baz", "foo") == "0-3"
+
+    assert exec_command(conn, "XRANGE", key, "0-2", "0-3") == [
+        ["0-2", ["bar", "baz"]],
+        ["0-3", ["baz", "foo"]],
+    ]

@@ -75,6 +75,7 @@ fn processImmediateCommand(
         .LPOP => try handlers.handleLpop(allocator, handler.string_store, handler.list_store, handler.stream_store, command_parts),
         .BLPOP => unreachable,
         .XADD => try handlers.handleXadd(allocator, handler, command_parts),
+        .XRANGE => try handlers.handleXrange(allocator, handler.string_store, handler.list_store, handler.stream_store, command_parts),
     };
 
     const notify_slice: ?[]WriteOp = if (notify_acc.items.len != 0)

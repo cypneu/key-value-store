@@ -38,6 +38,19 @@ fn stringArrayFromRangeView(allocator: std.mem.Allocator, rv: db.RangeView([]con
     return Reply{ .Array = arr };
 }
 
+fn streamEntryFieldsReply(allocator: std.mem.Allocator, fields: []const db.StreamEntryField) !Reply {
+    const total = fields.len * 2;
+    var arr = try allocator.alloc(Reply, total);
+
+    for (fields, 0..) |field, i| {
+        const base = i * 2;
+        arr[base] = Reply{ .BulkString = field.name };
+        arr[base + 1] = Reply{ .BulkString = field.value };
+    }
+
+    return Reply{ .Array = arr };
+}
+
 fn argumentCount(args: [64]?[]const u8) usize {
     var count: usize = 0;
     while (count < args.len) : (count += 1) {
@@ -220,7 +233,7 @@ pub fn handleXadd(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]
 
     if (pairs.items.len == 0) return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
 
-    const stored_entry_id = handler.stream_store.addEntry(key, entry_id, pairs.items) catch |err| {
+    const stored_entry_id = handler.stream_store.addEntry(allocator, key, entry_id, pairs.items) catch |err| {
         return switch (err) {
             error.EntryIdTooSmall => Reply{ .Error = .{ .kind = ErrorKind.XaddIdTooSmall } },
             error.EntryIdZero => Reply{ .Error = .{ .kind = ErrorKind.XaddIdNotGreaterThanZero } },
@@ -228,7 +241,44 @@ pub fn handleXadd(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]
             else => return err,
         };
     };
+
     return Reply{ .BulkString = stored_entry_id };
+}
+
+pub fn handleXrange(
+    allocator: std.mem.Allocator,
+    string_store: *db.StringStore,
+    list_store: *db.ListStore,
+    stream_store: *db.StreamStore,
+    args: [64]?[]const u8,
+) !Reply {
+    const key = args[1] orelse return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
+    const start_id = args[2] orelse return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
+    const end_id = args[3] orelse return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
+
+    if (string_store.contains(key)) return wrongTypeReply();
+    if (list_store.contains(key)) return wrongTypeReply();
+
+    const entries = stream_store.xrange(allocator, key, start_id, end_id) catch |err| {
+        return switch (err) {
+            error.InvalidRangeId => Reply{ .Error = .{ .kind = ErrorKind.Syntax } },
+            else => return err,
+        };
+    };
+
+    var outer = try allocator.alloc(Reply, entries.len);
+    for (entries, 0..) |entry_ptr, idx| {
+        const entry = entry_ptr.*;
+        var entry_reply = try allocator.alloc(Reply, 2);
+        var id_buf: [64]u8 = undefined;
+        const id_slice = try entry.id.format(id_buf[0..]);
+        const id_copy = try allocator.dupe(u8, id_slice);
+        entry_reply[0] = Reply{ .BulkString = id_copy };
+        entry_reply[1] = try streamEntryFieldsReply(allocator, entry.fields);
+        outer[idx] = Reply{ .Array = entry_reply };
+    }
+
+    return Reply{ .Array = outer };
 }
 
 pub fn handleBlpop(allocator: std.mem.Allocator, handler: *AppHandler, client_connection: *ClientConnection, args: [64]?[]const u8) !union(enum) { Value: Reply, Blocked } {
