@@ -16,6 +16,9 @@ pub const Command = enum {
     XRANGE,
     XREAD,
     INCR,
+    MULTI,
+    DISCARD,
+    EXEC,
 
     pub fn fromSlice(slice: []const u8) ?Command {
         if (std.ascii.eqlIgnoreCase(slice, "PING")) return .PING;
@@ -33,6 +36,9 @@ pub const Command = enum {
         if (std.ascii.eqlIgnoreCase(slice, "XRANGE")) return .XRANGE;
         if (std.ascii.eqlIgnoreCase(slice, "XREAD")) return .XREAD;
         if (std.ascii.eqlIgnoreCase(slice, "INCR")) return .INCR;
+        if (std.ascii.eqlIgnoreCase(slice, "MULTI")) return .MULTI;
+        if (std.ascii.eqlIgnoreCase(slice, "DISCARD")) return .DISCARD;
+        if (std.ascii.eqlIgnoreCase(slice, "EXEC")) return .EXEC;
         return null;
     }
 };

@@ -41,7 +41,7 @@ class RESPReader:
             return None
         return bytes(self.buf[start:idx]), idx + 2
 
-    def _parse(self, start: int = 0):
+    def _parse(self, start: int = 0, *, raise_errors: bool = True):
         if start >= len(self.buf):
             return None
         prefix = self.buf[start : start + 1]
@@ -63,7 +63,10 @@ class RESPReader:
             if res is None:
                 return None
             line, end = res
-            raise RuntimeError(line.decode())
+            message = line.decode()
+            if raise_errors:
+                raise RuntimeError(message)
+            return RuntimeError(message), end
 
         # Integer
         if t == ord(":"):
@@ -102,7 +105,7 @@ class RESPReader:
             items = []
             pos = end
             for _ in range(count):
-                parsed = self._parse(pos)
+                parsed = self._parse(pos, raise_errors=False)
                 if parsed is None:
                     return None
                 item, pos = parsed

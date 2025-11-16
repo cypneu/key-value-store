@@ -4,6 +4,7 @@ const dispatcher = @import("dispatcher.zig");
 const posix = std.posix;
 const format = @import("resp/format.zig");
 const Reply = @import("reply.zig").Reply;
+const Command = @import("command.zig").Command;
 const Order = std.math.Order;
 const StreamParser = @import("resp/stream_parser.zig").StreamParser;
 const StreamReadRequest = @import("handlers.zig").StreamReadRequest;
@@ -25,6 +26,8 @@ pub const ClientConnection = struct {
     blocking_node: ?*std.DoublyLinkedList(posix.fd_t).Node,
     deadline_us: ?i64,
     blocking_stream_state: ?StreamBlockingState,
+    in_transaction: bool,
+    transaction_queue: std.ArrayList(TransactionCommand),
 
     read_buffer: std.ArrayList(u8),
     read_start: usize,
@@ -41,6 +44,11 @@ const StreamRegistration = struct {
 const StreamBlockingState = struct {
     requests: []StreamReadRequest,
     registrations: []StreamRegistration,
+};
+
+pub const TransactionCommand = struct {
+    command: Command,
+    parts: [][]const u8,
 };
 
 pub const AppHandler = struct {
@@ -93,6 +101,8 @@ pub const AppHandler = struct {
         var it_conn = self.connection_by_fd.iterator();
         while (it_conn.next()) |entry| {
             entry.value_ptr.read_buffer.deinit();
+            self.clearTransactionQueue(entry.value_ptr);
+            entry.value_ptr.transaction_queue.deinit();
         }
         var it = self.blocked_clients_by_key.iterator();
         while (it.next()) |entry| {
@@ -157,6 +167,8 @@ pub const AppHandler = struct {
             .blocking_node = null,
             .deadline_us = null,
             .blocking_stream_state = null,
+            .in_transaction = false,
+            .transaction_queue = std.ArrayList(TransactionCommand).init(self.app_allocator),
             .read_buffer = std.ArrayList(u8).init(self.app_allocator),
             .read_start = 0,
             .parser = StreamParser.init(),
@@ -165,14 +177,20 @@ pub const AppHandler = struct {
 
     pub fn removeConnection(self: *AppHandler, client_fd: posix.fd_t) void {
         if (self.connection_by_fd.fetchRemove(client_fd)) |removed_connection| {
-            removed_connection.value.read_buffer.deinit();
-            if (removed_connection.value.blocking_key) |key| {
+            var conn = removed_connection.value;
+
+            conn.read_buffer.deinit();
+            self.clearTransactionQueue(&conn);
+            conn.transaction_queue.deinit();
+
+            if (conn.blocking_key) |key| {
                 const wait_list = self.blocked_clients_by_key.getPtr(key).?;
-                const node_ptr = removed_connection.value.blocking_node.?;
+                const node_ptr = conn.blocking_node.?;
                 wait_list.remove(node_ptr);
                 self.app_allocator.destroy(node_ptr);
             }
-            self.cleanupStreamBlockingState(removed_connection.value.blocking_stream_state);
+
+            self.cleanupStreamBlockingState(conn.blocking_stream_state);
         }
     }
 
@@ -198,6 +216,16 @@ pub const AppHandler = struct {
         self.cleanupStreamBlockingState(conn.blocking_stream_state);
         conn.blocking_stream_state = null;
         conn.deadline_us = null;
+    }
+
+    pub fn clearTransactionQueue(self: *AppHandler, conn: *ClientConnection) void {
+        for (conn.transaction_queue.items) |queued| {
+            for (queued.parts) |part| {
+                self.app_allocator.free(part);
+            }
+            self.app_allocator.free(queued.parts);
+        }
+        conn.transaction_queue.clearRetainingCapacity();
     }
 
     fn ensureStreamWaitList(self: *AppHandler, key: []const u8) !struct {

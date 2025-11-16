@@ -5,6 +5,10 @@ pub const ErrorKind = enum {
     WrongType,
     XaddIdTooSmall,
     XaddIdNotGreaterThanZero,
+    ExecWithoutMulti,
+    DiscardWithoutMulti,
+    NestedMulti,
+    UnknownCommand,
 };
 
 pub const Reply = union(enum) {
