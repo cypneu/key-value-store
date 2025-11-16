@@ -2,6 +2,7 @@ const std = @import("std");
 const db = @import("data_structures/mod.zig");
 const dispatcher = @import("dispatcher.zig");
 const posix = std.posix;
+const net = std.net;
 const format = @import("resp/format.zig");
 const Reply = @import("reply.zig").Reply;
 const Command = @import("command.zig").Command;
@@ -15,6 +16,11 @@ pub const WriteOp = struct {
 };
 
 pub const ServerRole = enum { master, replica };
+
+pub const ReplicaConfig = struct {
+    host: []const u8,
+    port: u16,
+};
 
 pub const IngestResult = union(enum) {
     Writes: []WriteOp,
@@ -60,6 +66,9 @@ pub const AppHandler = struct {
     stream_store: *db.StreamStore,
     role: ServerRole,
 
+    master: ?ReplicaConfig,
+    master_fd: ?posix.fd_t,
+
     connection_by_fd: std.hash_map.AutoHashMap(posix.fd_t, ClientConnection),
     blocked_clients_by_key: std.hash_map.StringHashMap(std.DoublyLinkedList(posix.fd_t)),
     blocked_stream_clients_by_key: std.hash_map.StringHashMap(StreamWaitList),
@@ -83,6 +92,7 @@ pub const AppHandler = struct {
         list_store: *db.ListStore,
         stream_store: *db.StreamStore,
         role: ServerRole,
+        master: ?ReplicaConfig,
     ) AppHandler {
         const connection_by_fd = std.hash_map.AutoHashMap(posix.fd_t, ClientConnection).init(allocator);
         const blocked_clients_by_key = std.hash_map.StringHashMap(std.DoublyLinkedList(posix.fd_t)).init(allocator);
@@ -95,6 +105,8 @@ pub const AppHandler = struct {
             .list_store = list_store,
             .stream_store = stream_store,
             .role = role,
+            .master = master,
+            .master_fd = null,
             .connection_by_fd = connection_by_fd,
             .blocked_clients_by_key = blocked_clients_by_key,
             .blocked_stream_clients_by_key = blocked_stream_clients_by_key,
@@ -120,8 +132,101 @@ pub const AppHandler = struct {
         }
         self.blocked_stream_clients_by_key.deinit();
 
+        if (self.master_fd) |fd| {
+            posix.close(fd);
+        }
+        if (self.master) |master| {
+            self.app_allocator.free(master.host);
+        }
+
         self.connection_by_fd.deinit();
         self.timeouts.deinit();
+    }
+
+    pub fn startReplication(self: *AppHandler, listening_port: u16) !void {
+        const replica = self.master orelse return;
+
+        var addrs = try net.getAddressList(self.app_allocator, replica.host, replica.port);
+        defer addrs.deinit();
+        if (addrs.addrs.len == 0) return error.InvalidReplicaAddress;
+
+        var connected_fd: ?posix.fd_t = null;
+        var last_err: anyerror = error.ConnectionRefused;
+
+        const socket_type = posix.SOCK.STREAM;
+        const protocol = posix.IPPROTO.TCP;
+
+        for (addrs.addrs) |address| {
+            const fd = posix.socket(address.any.family, socket_type, protocol) catch |err| {
+                last_err = err;
+                continue;
+            };
+
+            const connect_result = posix.connect(fd, &address.any, address.getOsSockLen());
+            if (connect_result) |_| {
+                connected_fd = fd;
+                break;
+            } else |err| {
+                last_err = err;
+                posix.close(fd);
+            }
+        }
+
+        const master_fd = connected_fd orelse return last_err;
+
+        try self.sendPing(master_fd);
+        try self.sendReplconfListeningPort(master_fd, listening_port);
+        try self.sendReplconfCapa(master_fd);
+        try self.sendPsync(master_fd);
+
+        self.master_fd = master_fd;
+    }
+
+    fn sendPing(self: *AppHandler, fd: posix.fd_t) !void {
+        const parts = [_][]const u8{"PING"};
+        try self.sendCommand(fd, &parts);
+    }
+
+    fn sendReplconfListeningPort(self: *AppHandler, fd: posix.fd_t, listening_port: u16) !void {
+        var port_buf: [16]u8 = undefined;
+        const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{listening_port});
+        const parts = [_][]const u8{ "REPLCONF", "listening-port", port_str };
+        try self.sendCommand(fd, &parts);
+    }
+
+    fn sendReplconfCapa(self: *AppHandler, fd: posix.fd_t) !void {
+        const parts = [_][]const u8{ "REPLCONF", "capa", "psync2" };
+        try self.sendCommand(fd, &parts);
+    }
+
+    fn sendPsync(self: *AppHandler, fd: posix.fd_t) !void {
+        const parts = [_][]const u8{ "PSYNC", "?", "-1" };
+        try self.sendCommand(fd, &parts);
+    }
+
+    fn sendCommand(self: *AppHandler, fd: posix.fd_t, parts: []const []const u8) !void {
+        var items = try self.app_allocator.alloc(Reply, parts.len);
+        defer self.app_allocator.free(items);
+        for (parts, 0..) |part, idx| {
+            items[idx] = Reply{ .BulkString = part };
+        }
+
+        const command = Reply{ .Array = items };
+        var buf = std.ArrayList(u8).init(self.app_allocator);
+        defer buf.deinit();
+
+        try format.writeReply(buf.writer(), command);
+        try self.writeAll(fd, buf.items);
+    }
+
+    fn writeAll(self: *AppHandler, fd: posix.fd_t, bytes: []const u8) !void {
+        _ = self;
+        var written: usize = 0;
+        while (written < bytes.len) {
+            const bytes_written = try posix.write(fd, bytes[written..]);
+            if (bytes_written == 0) return error.ConnectionClosed;
+            written += bytes_written;
+        }
     }
 
     pub fn ingest(self: *AppHandler, client_fd: posix.fd_t, incoming: []const u8, request_allocator: std.mem.Allocator) !IngestResult {
