@@ -74,6 +74,7 @@ fn processImmediateCommand(
         .GET => try handlers.handleGet(handler, command_parts),
         .TYPE => try handlers.handleType(handler, command_parts),
         .SET => try handlers.handleSet(handler, command_parts),
+        .INCR => try handlers.handleIncr(handler, command_parts),
 
         .LPUSH => blk: {
             const out = try handlers.handleLpush(allocator, handler, command_parts);

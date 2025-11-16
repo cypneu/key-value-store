@@ -367,6 +367,30 @@ pub fn handleSet(handler: *AppHandler, args: [64]?[]const u8) !Reply {
     return .{ .SimpleString = "OK" };
 }
 
+pub fn handleIncr(handler: *AppHandler, args: [64]?[]const u8) !Reply {
+    const key = args[1] orelse return .{ .Error = .{ .kind = ErrorKind.ArgNum } };
+
+    if (handler.list_store.contains(key)) return wrongTypeReply();
+    if (handler.stream_store.contains(key)) return wrongTypeReply();
+
+    const current = handler.string_store.getWithExpiration(key) orelse {
+        const initial: i64 = 1;
+        var buf: [32]u8 = undefined;
+        const slice = try std.fmt.bufPrint(&buf, "{d}", .{initial});
+        try handler.string_store.set(key, slice, null);
+        return .{ .Integer = initial };
+    };
+
+    const parsed = std.fmt.parseInt(i64, current.data, 10) catch return .{ .Error = .{ .kind = ErrorKind.NotInteger } };
+    const incremented = std.math.add(i64, parsed, 1) catch return .{ .Error = .{ .kind = ErrorKind.NotInteger } };
+
+    var buf: [32]u8 = undefined;
+    const slice = try std.fmt.bufPrint(&buf, "{d}", .{incremented});
+    try handler.string_store.set(key, slice, current.expiration_us);
+
+    return .{ .Integer = incremented };
+}
+
 pub fn handleLpush(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !CommandOutcome {
     return handlePush(true, allocator, handler, args);
 }

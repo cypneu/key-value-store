@@ -55,6 +55,17 @@ pub const StringStore = struct {
         return entry.value_ptr.data;
     }
 
+    pub fn getWithExpiration(self: *StringStore, key: []const u8) ?struct { data: []const u8, expiration_us: ?i64 } {
+        const entry = self.data.getEntry(key) orelse return null;
+
+        if (entry.value_ptr.isExpired()) {
+            self.delete(key);
+            return null;
+        }
+
+        return .{ .data = entry.value_ptr.data, .expiration_us = entry.value_ptr.expiration_us };
+    }
+
     pub fn delete(self: *StringStore, key: []const u8) void {
         if (self.data.fetchRemove(key)) |removed| {
             self.allocator.free(removed.value.data);
