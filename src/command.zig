@@ -19,6 +19,7 @@ pub const Command = enum {
     MULTI,
     DISCARD,
     EXEC,
+    INFO,
 
     pub fn fromSlice(slice: []const u8) ?Command {
         if (std.ascii.eqlIgnoreCase(slice, "PING")) return .PING;
@@ -39,6 +40,7 @@ pub const Command = enum {
         if (std.ascii.eqlIgnoreCase(slice, "MULTI")) return .MULTI;
         if (std.ascii.eqlIgnoreCase(slice, "DISCARD")) return .DISCARD;
         if (std.ascii.eqlIgnoreCase(slice, "EXEC")) return .EXEC;
+        if (std.ascii.eqlIgnoreCase(slice, "INFO")) return .INFO;
         return null;
     }
 };

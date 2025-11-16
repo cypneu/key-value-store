@@ -7,6 +7,10 @@ const Reply = @import("reply.zig").Reply;
 const ErrorKind = @import("reply.zig").ErrorKind;
 const WriteOp = @import("state.zig").WriteOp;
 
+const DEFAULT_REPL_ID = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+const INFO_MASTER = "role:master\r\nmaster_replid:" ++ DEFAULT_REPL_ID ++ "\r\nmaster_repl_offset:0\r\n";
+const INFO_REPLICA = "role:slave\r\nmaster_replid:" ++ DEFAULT_REPL_ID ++ "\r\nmaster_repl_offset:0\r\n";
+
 pub const CommandOutcome = struct {
     reply: Reply,
     notify: []WriteOp,
@@ -389,6 +393,12 @@ pub fn handleIncr(handler: *AppHandler, args: [64]?[]const u8) !Reply {
     try handler.string_store.set(key, slice, current.expiration_us);
 
     return .{ .Integer = incremented };
+}
+
+pub fn handleInfo(handler: *AppHandler, args: [64]?[]const u8) !Reply {
+    _ = args;
+    const info = if (handler.role == .replica) INFO_REPLICA else INFO_MASTER;
+    return .{ .BulkString = info };
 }
 
 pub fn handleLpush(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !CommandOutcome {

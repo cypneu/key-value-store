@@ -14,6 +14,8 @@ pub const WriteOp = struct {
     bytes: []const u8,
 };
 
+pub const ServerRole = enum { master, replica };
+
 pub const IngestResult = union(enum) {
     Writes: []WriteOp,
     Blocked,
@@ -56,6 +58,7 @@ pub const AppHandler = struct {
     string_store: *db.StringStore,
     list_store: *db.ListStore,
     stream_store: *db.StreamStore,
+    role: ServerRole,
 
     connection_by_fd: std.hash_map.AutoHashMap(posix.fd_t, ClientConnection),
     blocked_clients_by_key: std.hash_map.StringHashMap(std.DoublyLinkedList(posix.fd_t)),
@@ -79,6 +82,7 @@ pub const AppHandler = struct {
         string_store: *db.StringStore,
         list_store: *db.ListStore,
         stream_store: *db.StreamStore,
+        role: ServerRole,
     ) AppHandler {
         const connection_by_fd = std.hash_map.AutoHashMap(posix.fd_t, ClientConnection).init(allocator);
         const blocked_clients_by_key = std.hash_map.StringHashMap(std.DoublyLinkedList(posix.fd_t)).init(allocator);
@@ -90,6 +94,7 @@ pub const AppHandler = struct {
             .string_store = string_store,
             .list_store = list_store,
             .stream_store = stream_store,
+            .role = role,
             .connection_by_fd = connection_by_fd,
             .blocked_clients_by_key = blocked_clients_by_key,
             .blocked_stream_clients_by_key = blocked_stream_clients_by_key,

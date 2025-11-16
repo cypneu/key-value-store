@@ -86,6 +86,7 @@ fn processImmediateCommand(
         .TYPE => .{ .reply = try handlers.handleType(handler, command_parts), .notify = null },
         .SET => .{ .reply = try handlers.handleSet(handler, command_parts), .notify = null },
         .INCR => .{ .reply = try handlers.handleIncr(handler, command_parts), .notify = null },
+        .INFO => .{ .reply = try handlers.handleInfo(handler, command_parts), .notify = null },
 
         .LPUSH => blk: {
             const out = try handlers.handleLpush(allocator, handler, command_parts);
@@ -252,6 +253,7 @@ fn executeCommand(
         .TYPE => try handlers.handleType(handler, command_parts),
         .SET => try handlers.handleSet(handler, command_parts),
         .INCR => try handlers.handleIncr(handler, command_parts),
+        .INFO => try handlers.handleInfo(handler, command_parts),
         .LPUSH => blk: {
             const out = try handlers.handleLpush(allocator, handler, command_parts);
             try appendNotify(&notify_acc, out.notify);
