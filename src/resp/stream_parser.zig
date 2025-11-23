@@ -18,19 +18,28 @@ pub const StreamParser = struct {
     };
 
     const State = enum {
-        ExpectArrayStart,
+        ExpectStart,
+        // Array states
         ArrayLenDigits,
         ExpectLFArrayLen,
         ExpectArgOrDone,
         ExpectBulkStart,
+        // Bulk states (shared)
         BulkLenDigits,
         ExpectLFBulkLen,
         BulkData,
         BulkCR,
         BulkLF,
+        // Simple String states
+        SimpleString,
+        SimpleStringCR,
+        SimpleStringLF,
     };
 
-    state: State = .ExpectArrayStart,
+    const Mode = enum { Array, SimpleString, TopLevelBulk };
+
+    state: State = .ExpectStart,
+    mode: Mode = .Array,
     cursor: usize = 0,
 
     array_len: usize = 0,
@@ -41,6 +50,8 @@ pub const StreamParser = struct {
     num_had_digit: bool = false,
 
     bulk_remaining: usize = 0,
+    simple_string_start: usize = 0,
+    allow_bulk_without_crlf: bool = false,
 
     const PartIndex = struct { start: usize, len: usize };
 
@@ -49,7 +60,7 @@ pub const StreamParser = struct {
 
         while (true) {
             const outcome = switch (self.state) {
-                .ExpectArrayStart => self.handleExpectArrayStart(buf, &i),
+                .ExpectStart => self.handleExpectStart(buf, &i),
                 .ArrayLenDigits => self.handleArrayLenDigits(buf, &i),
                 .ExpectLFArrayLen => self.handleExpectLfArrayLen(buf, &i),
                 .ExpectArgOrDone => self.handleExpectArgOrDone(buf, &i),
@@ -59,24 +70,87 @@ pub const StreamParser = struct {
                 .BulkData => self.handleBulkData(buf, &i),
                 .BulkCR => self.handleBulkCr(buf, &i),
                 .BulkLF => self.handleBulkLf(buf, &i),
+                .SimpleString => self.handleSimpleString(buf, &i),
+                .SimpleStringCR => self.handleSimpleStringCr(buf, &i),
+                .SimpleStringLF => self.handleSimpleStringLf(buf, &i),
             };
 
             if (outcome) |result| return result;
         }
     }
 
-    fn handleExpectArrayStart(self: *StreamParser, buf: []const u8, idx_ptr: *usize) ?ParseResult {
+    fn handleExpectStart(self: *StreamParser, buf: []const u8, idx_ptr: *usize) ?ParseResult {
         var i = idx_ptr.*;
         if (i >= buf.len) return self.needMore(i);
 
         const prefix = buf[i];
-        if (prefix != '*') return .{ .Error = Error.NotArray };
-
         i += 1;
-        self.startNumber();
-        self.state = .ArrayLenDigits;
+
+        switch (prefix) {
+            '*' => {
+                self.mode = .Array;
+                self.startNumber();
+                self.state = .ArrayLenDigits;
+                idx_ptr.* = i;
+                return null;
+            },
+            '$' => {
+                self.mode = .TopLevelBulk;
+                self.startNumber();
+                self.state = .BulkLenDigits;
+                idx_ptr.* = i;
+                return null;
+            },
+            '+' => {
+                self.mode = .SimpleString;
+                self.simple_string_start = i;
+                self.state = .SimpleString;
+                idx_ptr.* = i;
+                return null;
+            },
+            else => return .{ .Error = Error.NotArray },
+        }
+    }
+
+    fn handleSimpleString(self: *StreamParser, buf: []const u8, idx_ptr: *usize) ?ParseResult {
+        var i = idx_ptr.*;
+
+        while (i < buf.len) {
+            if (buf[i] == '\r') {
+                self.args_idx[0] = PartIndex{ .start = self.simple_string_start, .len = i - self.simple_string_start };
+                self.args_count = 1;
+
+                i += 1;
+                self.state = .SimpleStringLF;
+                idx_ptr.* = i;
+                return null;
+            }
+            i += 1;
+        }
+
+        return self.needMore(i);
+    }
+
+    fn handleSimpleStringCr(self: *StreamParser, buf: []const u8, idx_ptr: *usize) ?ParseResult {
+        var i = idx_ptr.*;
+        if (i >= buf.len) return self.needMore(i);
+
+        if (buf[i] != '\r') return .{ .Error = Error.MissingCLRF };
+        i += 1;
+
+        self.state = .SimpleStringLF;
         idx_ptr.* = i;
         return null;
+    }
+
+    fn handleSimpleStringLf(self: *StreamParser, buf: []const u8, idx_ptr: *usize) ?ParseResult {
+        var i = idx_ptr.*;
+        if (i >= buf.len) return self.needMore(i);
+
+        if (buf[i] != '\n') return .{ .Error = Error.MissingCLRF };
+        i += 1;
+
+        return self.finishMessage(buf, i);
     }
 
     fn handleArrayLenDigits(self: *StreamParser, buf: []const u8, idx_ptr: *usize) ?ParseResult {
@@ -204,11 +278,15 @@ pub const StreamParser = struct {
         self.args_idx[self.args_count] = PartIndex{ .start = start, .len = end - start };
         i = end;
         self.bulk_remaining = 0;
+
+        if (self.mode == .TopLevelBulk and self.allow_bulk_without_crlf) {
+            return self.finishMessage(buf, i);
+        }
+
         self.state = .BulkCR;
         idx_ptr.* = i;
         return null;
     }
-
     fn handleBulkCr(self: *StreamParser, buf: []const u8, idx_ptr: *usize) ?ParseResult {
         var i = idx_ptr.*;
         if (i >= buf.len) return self.needMore(i);
@@ -229,11 +307,16 @@ pub const StreamParser = struct {
         i += 1;
 
         self.args_count += 1;
-        if (self.args_count == self.array_len) {
+
+        if (self.mode == .TopLevelBulk) {
             return self.finishMessage(buf, i);
+        } else {
+            if (self.args_count == self.array_len) {
+                return self.finishMessage(buf, i);
+            }
+            self.state = .ExpectBulkStart;
         }
 
-        self.state = .ExpectBulkStart;
         idx_ptr.* = i;
         return null;
     }
@@ -248,7 +331,8 @@ pub const StreamParser = struct {
         }
 
         self.cursor = consumed;
-        self.state = .ExpectArrayStart;
+        self.state = .ExpectStart;
+        self.mode = .Array;
         self.array_len = 0;
         self.bulk_remaining = 0;
         self.clearArgState();
@@ -260,7 +344,9 @@ pub const StreamParser = struct {
     }
 
     pub fn reset(self: *StreamParser) void {
+        const allow = self.allow_bulk_without_crlf;
         self.* = .{};
+        self.allow_bulk_without_crlf = allow;
     }
 
     inline fn needMore(self: *StreamParser, idx: usize) ParseResult {

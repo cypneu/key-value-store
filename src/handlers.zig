@@ -6,6 +6,7 @@ const AppHandler = @import("state.zig").AppHandler;
 const Reply = @import("reply.zig").Reply;
 const ErrorKind = @import("reply.zig").ErrorKind;
 const WriteOp = @import("state.zig").WriteOp;
+const replication = @import("replication.zig");
 
 const DEFAULT_REPL_ID = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
 const INFO_MASTER = "role:master\r\nmaster_replid:" ++ DEFAULT_REPL_ID ++ "\r\nmaster_repl_offset:0\r\n";
@@ -244,10 +245,10 @@ fn notifyStreamWaiters(allocator: std.mem.Allocator, handler: *AppHandler, key: 
     while (node_ptr_opt) |node_ptr| {
         const next = node_ptr.next;
 
-        const fd = node_ptr.data;
-        if (handler.connection_by_fd.getPtr(fd)) |connection| {
+        const id = node_ptr.data;
+        if (handler.connection_by_id.getPtr(id)) |connection| {
             if (try tryResumeXreadConnection(allocator, handler, connection)) |bytes| {
-                try notifications.append(.{ .fd = fd, .bytes = bytes });
+                try notifications.append(.{ .connection_id = id, .bytes = bytes });
             }
         } else {
             wait_list_ptr.remove(node_ptr);
@@ -279,14 +280,26 @@ fn ensureListOperationAllowed(handler: *AppHandler, key: []const u8) !void {
     }
 }
 
-fn tryImmediateBlpop(allocator: std.mem.Allocator, handler: *AppHandler, key: []const u8) !?Reply {
+fn tryImmediateBlpop(allocator: std.mem.Allocator, handler: *AppHandler, key: []const u8) !?CommandOutcome {
     const popped_values = try handler.list_store.lpop(key, 1, allocator);
     if (popped_values.len == 0) return null;
 
     var arr = try allocator.alloc(Reply, 2);
     arr[0] = Reply{ .BulkString = key };
     arr[1] = Reply{ .BulkString = popped_values[0] };
-    return Reply{ .Array = arr };
+
+    const reply = Reply{ .Array = arr };
+
+    var args: [64]?[]const u8 = undefined;
+    args[0] = "LPOP";
+    args[1] = key;
+
+    const notify = try replication.propagateCommand(allocator, handler.replicas.items, args, 2);
+
+    return CommandOutcome{
+        .reply = reply,
+        .notify = notify,
+    };
 }
 
 fn registerBlockingClient(handler: *AppHandler, client_connection: *ClientConnection, key: []const u8, timeout_secs: f64) !void {
@@ -296,9 +309,9 @@ fn registerBlockingClient(handler: *AppHandler, client_connection: *ClientConnec
         gop.value_ptr.* = .{};
     }
 
-    const NodeType = std.DoublyLinkedList(std.posix.fd_t).Node;
+    const NodeType = std.DoublyLinkedList(u64).Node;
     const node_ptr = try handler.app_allocator.create(NodeType);
-    node_ptr.* = .{ .data = client_connection.fd };
+    node_ptr.* = .{ .data = client_connection.id };
     gop.value_ptr.append(node_ptr);
 
     client_connection.*.blocking_key = gop.key_ptr.*;
@@ -310,7 +323,7 @@ fn registerBlockingClient(handler: *AppHandler, client_connection: *ClientConnec
         const deadline_us: i64 = now_us + delta_us;
         client_connection.*.deadline_us = deadline_us;
 
-        try handler.timeouts.add(.{ .deadline_us = deadline_us, .fd = client_connection.fd });
+        try handler.timeouts.add(.{ .deadline_us = deadline_us, .connection_id = client_connection.id });
     } else {
         client_connection.*.deadline_us = null;
     }
@@ -424,11 +437,35 @@ fn handlePush(comptime is_left: bool, allocator: std.mem.Allocator, handler: *Ap
         pushed += 1;
     }
 
-    const notify = try handler.drainWaitersForKey(allocator, key, pushed);
+    const drain_result = try handler.drainWaitersForKey(allocator, key, pushed);
+
+    var notify_list = std.ArrayList(WriteOp).init(allocator);
+    errdefer notify_list.deinit();
+
+    try notify_list.appendSlice(drain_result.ops);
+
+    if (drain_result.popped > 0) {
+        var lpop_args: [64]?[]const u8 = undefined;
+        @memset(lpop_args[0..], null);
+        lpop_args[0] = "LPOP";
+        lpop_args[1] = key;
+
+        var arg_count: usize = 2;
+        var count_buf: [32]u8 = undefined;
+
+        if (drain_result.popped > 1) {
+            const count_str = try std.fmt.bufPrint(&count_buf, "{d}", .{drain_result.popped});
+            lpop_args[2] = count_str;
+            arg_count = 3;
+        }
+
+        const lpop_notify = try replication.propagateCommand(allocator, handler.replicas.items, lpop_args, arg_count);
+        try notify_list.appendSlice(lpop_notify);
+    }
 
     return .{
         .reply = Reply{ .Integer = @intCast(length) },
-        .notify = notify,
+        .notify = try notify_list.toOwnedSlice(),
     };
 }
 
@@ -577,26 +614,58 @@ pub fn handleXread(
     return .{ .Value = Reply{ .Array = null } };
 }
 
-pub fn handleBlpop(allocator: std.mem.Allocator, handler: *AppHandler, client_connection: *ClientConnection, args: [64]?[]const u8) !union(enum) { Value: Reply, Blocked } {
+pub fn handleBlpop(allocator: std.mem.Allocator, handler: *AppHandler, client_connection: *ClientConnection, args: [64]?[]const u8) !union(enum) { Value: CommandOutcome, Blocked } {
     const request = parseBlpopRequest(args) catch |err| {
-        return .{ .Value = switch (err) {
+        return .{ .Value = .{ .reply = switch (err) {
             error.ArgNum => Reply{ .Error = .{ .kind = ErrorKind.ArgNum } },
             error.NotInteger => Reply{ .Error = .{ .kind = ErrorKind.NotInteger } },
             else => return err,
-        } };
+        }, .notify = &.{} } };
     };
 
     ensureListOperationAllowed(handler, request.key) catch |err| {
-        return .{ .Value = switch (err) {
+        return .{ .Value = .{ .reply = switch (err) {
             error.WrongType => wrongTypeReply(),
             else => return err,
-        } };
+        }, .notify = &.{} } };
     };
 
-    if (try tryImmediateBlpop(allocator, handler, request.key)) |reply| {
-        return .{ .Value = reply };
+    if (try tryImmediateBlpop(allocator, handler, request.key)) |outcome| {
+        return .{ .Value = outcome };
     }
 
     try registerBlockingClient(handler, client_connection, request.key, request.timeout_secs);
     return .Blocked;
+}
+
+pub fn handleReplconf(args: [64]?[]const u8) !Reply {
+    _ = args;
+    return Reply{ .SimpleString = "OK" };
+}
+
+pub fn handlePsync(allocator: std.mem.Allocator, handler: *AppHandler, connection: *ClientConnection, args: [64]?[]const u8) !Reply {
+    _ = args;
+
+    const empty_rdb_base64 = "UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZWXCUIhuAPoIYW9mLWJhc2XAAP/wbjv+wP9aog==";
+
+    const size = try std.base64.standard.Decoder.calcSizeForSlice(empty_rdb_base64);
+
+    const rdb_bytes = try allocator.alloc(u8, size);
+
+    try std.base64.standard.Decoder.decode(rdb_bytes, empty_rdb_base64);
+
+    var buf = std.ArrayList(u8).init(allocator);
+
+    try buf.appendSlice("+FULLRESYNC " ++ DEFAULT_REPL_ID ++ " 0\r\n");
+
+    try buf.writer().print("${d}\r\n", .{rdb_bytes.len});
+
+    try buf.appendSlice(rdb_bytes);
+
+    if (!connection.is_replica) {
+        connection.is_replica = true;
+        try handler.replicas.append(connection.id);
+    }
+
+    return Reply{ .Bytes = try buf.toOwnedSlice() };
 }

@@ -8,6 +8,7 @@ const format = @import("resp/format.zig");
 const Reply = @import("reply.zig").Reply;
 const ErrorKind = @import("reply.zig").ErrorKind;
 const WriteOp = @import("state.zig").WriteOp;
+const replication = @import("replication.zig");
 
 pub const ProcessResult = union(enum) {
     Immediate: struct { bytes: []const u8, notify: ?[]WriteOp },
@@ -19,51 +20,139 @@ const ImmediateCommandResult = struct {
     notify: ?[]WriteOp,
 };
 
+const CommandResult = struct {
+    reply: Reply,
+    notify: []WriteOp,
+};
+
 pub fn dispatchCommand(handler: *AppHandler, request_allocator: std.mem.Allocator, command_parts: [64]?[]const u8, client_connection: *ClientConnection) !ProcessResult {
+    const is_from_master = if (handler.master_connection_id) |mid| mid == client_connection.id else false;
+
     const command_str = command_parts[0] orelse return emptyImmediate();
     const command = Command.fromSlice(command_str) orelse {
+        if (is_from_master) {
+            return emptyImmediate();
+        }
         const bytes = try renderReply(request_allocator, Reply{ .Error = .{ .kind = ErrorKind.UnknownCommand } });
         return makeImmediate(bytes, null);
     };
 
-    return switch (command) {
-        .BLPOP => handleBlockingBlpop(request_allocator, handler, client_connection, command_parts),
-        .XREAD => handleBlockingXread(request_allocator, handler, client_connection, command_parts),
+    const result = switch (command) {
+        .BLPOP => blk: {
+            const blpop_result = try handlers.handleBlpop(request_allocator, handler, client_connection, command_parts);
+            break :blk switch (blpop_result) {
+                .Value => |outcome| makeImmediate(try renderReply(request_allocator, outcome.reply), outcome.notify),
+                .Blocked => ProcessResult.Blocked,
+            };
+        },
+        .XREAD => blk: {
+            const xread_result = try handlers.handleXread(request_allocator, handler, client_connection, command_parts);
+            break :blk switch (xread_result) {
+                .Value => |reply| makeImmediate(try renderReply(request_allocator, reply), null),
+                .Blocked => ProcessResult.Blocked,
+            };
+        },
         else => blk: {
-            const immediate = try processImmediateCommand(request_allocator, handler, client_connection, command, command_parts);
+            const immediate = try dispatchImmediateCommand(request_allocator, handler, client_connection, command, command_parts);
             const bytes = try renderReply(request_allocator, immediate.reply);
             break :blk makeImmediate(bytes, immediate.notify);
         },
     };
+
+    if (is_from_master) {
+        switch (result) {
+            .Immediate => |imm| {
+                return ProcessResult{ .Immediate = .{ .bytes = &[_]u8{}, .notify = imm.notify } };
+            },
+            .Blocked => return result,
+        }
+    }
+
+    return result;
 }
 
-fn handleBlockingBlpop(
+fn executeCommand(
     allocator: std.mem.Allocator,
     handler: *AppHandler,
-    connection: *ClientConnection,
+    client_connection: *ClientConnection,
+    command: Command,
     command_parts: [64]?[]const u8,
-) !ProcessResult {
-    const blpop_result = try handlers.handleBlpop(allocator, handler, connection, command_parts);
-    return switch (blpop_result) {
-        .Value => |reply| makeImmediate(try renderReply(allocator, reply), null),
-        .Blocked => ProcessResult.Blocked,
+) !CommandResult {
+    return switch (command) {
+        .PING => .{ .reply = Reply{ .SimpleString = "PONG" }, .notify = &.{} },
+        .ECHO => .{ .reply = try handlers.handleEcho(command_parts), .notify = &.{} },
+        .GET => .{ .reply = try handlers.handleGet(handler, command_parts), .notify = &.{} },
+        .TYPE => .{ .reply = try handlers.handleType(handler, command_parts), .notify = &.{} },
+        .SET => .{ .reply = try handlers.handleSet(handler, command_parts), .notify = &.{} },
+        .INCR => .{ .reply = try handlers.handleIncr(handler, command_parts), .notify = &.{} },
+        .INFO => .{ .reply = try handlers.handleInfo(handler, command_parts), .notify = &.{} },
+        .LPUSH => blk: {
+            const out = try handlers.handleLpush(allocator, handler, command_parts);
+            break :blk .{ .reply = out.reply, .notify = out.notify };
+        },
+        .RPUSH => blk: {
+            const out = try handlers.handleRpush(allocator, handler, command_parts);
+            break :blk .{ .reply = out.reply, .notify = out.notify };
+        },
+        .LRANGE => .{ .reply = try handlers.handleLrange(allocator, handler, command_parts), .notify = &.{} },
+        .LLEN => .{ .reply = try handlers.handleLlen(handler, command_parts), .notify = &.{} },
+        .LPOP => .{ .reply = try handlers.handleLpop(allocator, handler, command_parts), .notify = &.{} },
+        .XADD => blk: {
+            const out = try handlers.handleXadd(allocator, handler, command_parts);
+            break :blk .{ .reply = out.reply, .notify = out.notify };
+        },
+        .XRANGE => .{ .reply = try handlers.handleXrange(allocator, handler, command_parts), .notify = &.{} },
+        .REPLCONF => .{ .reply = try handlers.handleReplconf(command_parts), .notify = &.{} },
+        .PSYNC => .{ .reply = try handlers.handlePsync(allocator, handler, client_connection, command_parts), .notify = &.{} },
+        else => unreachable,
     };
 }
 
-fn handleBlockingXread(
+fn runCommandWithPropagation(
     allocator: std.mem.Allocator,
     handler: *AppHandler,
-    connection: *ClientConnection,
+    client_connection: *ClientConnection,
+    command: Command,
     command_parts: [64]?[]const u8,
-) !ProcessResult {
-    const xread_result = try handlers.handleXread(allocator, handler, connection, command_parts);
-    return switch (xread_result) {
-        .Value => |reply| makeImmediate(try renderReply(allocator, reply), null),
-        .Blocked => ProcessResult.Blocked,
+) !ImmediateCommandResult {
+    const result = try executeCommand(allocator, handler, client_connection, command, command_parts);
+    const notify = try collectNotifications(allocator, handler, command, command_parts, result);
+    return .{ .reply = result.reply, .notify = notify };
+}
+
+fn collectNotifications(
+    allocator: std.mem.Allocator,
+    handler: *AppHandler,
+    command: Command,
+    command_parts: [64]?[]const u8,
+    result: CommandResult,
+) !?[]WriteOp {
+    var notifications = std.ArrayList(WriteOp).init(allocator);
+    errdefer notifications.deinit();
+
+    if (replication.isReplicationCommand(command) and !replyIsError(result.reply)) {
+        const part_count = countCommandParts(command_parts);
+        const replicas = try replication.propagateCommand(allocator, handler.replicas.items, command_parts, part_count);
+        try appendNotify(&notifications, replicas);
+    }
+
+    try appendNotify(&notifications, result.notify);
+
+    if (notifications.items.len == 0) {
+        return null;
+    }
+
+    return try notifications.toOwnedSlice();
+}
+
+fn replyIsError(reply: Reply) bool {
+    return switch (reply) {
+        .Error => true,
+        else => false,
     };
 }
 
-fn processImmediateCommand(
+fn dispatchImmediateCommand(
     allocator: std.mem.Allocator,
     handler: *AppHandler,
     connection: *ClientConnection,
@@ -75,53 +164,12 @@ fn processImmediateCommand(
         return .{ .reply = Reply{ .SimpleString = "QUEUED" }, .notify = null };
     }
 
-    var notify_acc = std.ArrayList(WriteOp).init(allocator);
-    errdefer notify_acc.deinit();
-
-    const immediate: ImmediateCommandResult = switch (command) {
-        .EXEC => try handleExec(allocator, handler, connection),
-        .PING => .{ .reply = Reply{ .SimpleString = "PONG" }, .notify = null },
-        .ECHO => .{ .reply = try handlers.handleEcho(command_parts), .notify = null },
-        .GET => .{ .reply = try handlers.handleGet(handler, command_parts), .notify = null },
-        .TYPE => .{ .reply = try handlers.handleType(handler, command_parts), .notify = null },
-        .SET => .{ .reply = try handlers.handleSet(handler, command_parts), .notify = null },
-        .INCR => .{ .reply = try handlers.handleIncr(handler, command_parts), .notify = null },
-        .INFO => .{ .reply = try handlers.handleInfo(handler, command_parts), .notify = null },
-
-        .LPUSH => blk: {
-            const out = try handlers.handleLpush(allocator, handler, command_parts);
-            try appendNotify(&notify_acc, out.notify);
-            break :blk .{ .reply = out.reply, .notify = null };
-        },
-        .RPUSH => blk: {
-            const out = try handlers.handleRpush(allocator, handler, command_parts);
-            try appendNotify(&notify_acc, out.notify);
-            break :blk .{ .reply = out.reply, .notify = null };
-        },
-        .LRANGE => .{ .reply = try handlers.handleLrange(allocator, handler, command_parts), .notify = null },
-        .LLEN => .{ .reply = try handlers.handleLlen(handler, command_parts), .notify = null },
-        .LPOP => .{ .reply = try handlers.handleLpop(allocator, handler, command_parts), .notify = null },
-        .BLPOP => unreachable,
-        .XADD => blk: {
-            const out = try handlers.handleXadd(allocator, handler, command_parts);
-            try appendNotify(&notify_acc, out.notify);
-            break :blk .{ .reply = out.reply, .notify = null };
-        },
-        .XRANGE => .{ .reply = try handlers.handleXrange(allocator, handler, command_parts), .notify = null },
-        .XREAD => unreachable,
-        .MULTI => handleMulti(handler, connection),
-        .DISCARD => handleDiscard(handler, connection),
-    };
-
-    const notify_slice: ?[]WriteOp = if (immediate.notify != null) immediate.notify else blk: {
-        if (notify_acc.items.len != 0) {
-            break :blk try notify_acc.toOwnedSlice();
-        } else {
-            break :blk null;
-        }
-    };
-
-    return .{ .reply = immediate.reply, .notify = notify_slice };
+    switch (command) {
+        .MULTI => return handleMulti(handler, connection),
+        .DISCARD => return handleDiscard(handler, connection),
+        .EXEC => return try handleExec(allocator, handler, connection),
+        else => return try runCommandWithPropagation(allocator, handler, connection, command, command_parts),
+    }
 }
 
 fn queueTransactionCommand(
@@ -205,82 +253,67 @@ fn handleExec(
     }
 
     connection.in_transaction = false;
-    errdefer handler.clearTransactionQueue(connection);
+    defer handler.clearTransactionQueue(connection);
 
+    const result = try executeQueuedTransaction(allocator, handler, connection);
+    const notify = try wrapInMultiExec(allocator, handler, result.notify);
+
+    return .{ .reply = result.reply, .notify = notify };
+}
+
+fn executeQueuedTransaction(
+    allocator: std.mem.Allocator,
+    handler: *AppHandler,
+    connection: *ClientConnection,
+) !CommandResult {
     var replies = std.ArrayList(Reply).init(allocator);
     errdefer replies.deinit();
 
-    var notify_acc = std.ArrayList(WriteOp).init(allocator);
-    errdefer notify_acc.deinit();
+    var notifications = std.ArrayList(WriteOp).init(allocator);
+    errdefer notifications.deinit();
 
     for (connection.transaction_queue.items) |queued| {
-        var queued_parts: [64]?[]const u8 = undefined;
-        @memset(queued_parts[0..], null);
-        for (queued.parts, 0..) |part, idx| {
-            queued_parts[idx] = part;
+        var parts: [64]?[]const u8 = undefined;
+        @memset(parts[0..], null);
+        for (queued.parts, 0..) |p, i| {
+            parts[i] = p;
         }
 
-        const immediate = try executeCommand(allocator, handler, queued.command, queued_parts);
-        try replies.append(immediate.reply);
-
-        if (immediate.notify) |ns| try notify_acc.appendSlice(ns);
+        const result = try runCommandWithPropagation(allocator, handler, connection, queued.command, parts);
+        try replies.append(result.reply);
+        if (result.notify) |ops| try notifications.appendSlice(ops);
     }
 
-    const replies_slice = try replies.toOwnedSlice();
-    handler.clearTransactionQueue(connection);
-
-    const notify_slice: ?[]WriteOp = if (notify_acc.items.len != 0)
-        try notify_acc.toOwnedSlice()
-    else
-        null;
-
-    return .{ .reply = Reply{ .Array = replies_slice }, .notify = notify_slice };
+    return .{
+        .reply = Reply{ .Array = try replies.toOwnedSlice() },
+        .notify = try notifications.toOwnedSlice(),
+    };
 }
 
-fn executeCommand(
+fn wrapInMultiExec(
     allocator: std.mem.Allocator,
     handler: *AppHandler,
-    command: Command,
-    command_parts: [64]?[]const u8,
-) !ImmediateCommandResult {
-    var notify_acc = std.ArrayList(WriteOp).init(allocator);
-    errdefer notify_acc.deinit();
+    ops: []WriteOp,
+) !?[]WriteOp {
+    if (ops.len == 0) return null;
+    defer allocator.free(ops);
 
-    const reply: Reply = switch (command) {
-        .PING => Reply{ .SimpleString = "PONG" },
-        .ECHO => try handlers.handleEcho(command_parts),
-        .GET => try handlers.handleGet(handler, command_parts),
-        .TYPE => try handlers.handleType(handler, command_parts),
-        .SET => try handlers.handleSet(handler, command_parts),
-        .INCR => try handlers.handleIncr(handler, command_parts),
-        .INFO => try handlers.handleInfo(handler, command_parts),
-        .LPUSH => blk: {
-            const out = try handlers.handleLpush(allocator, handler, command_parts);
-            try appendNotify(&notify_acc, out.notify);
-            break :blk out.reply;
-        },
-        .RPUSH => blk: {
-            const out = try handlers.handleRpush(allocator, handler, command_parts);
-            try appendNotify(&notify_acc, out.notify);
-            break :blk out.reply;
-        },
-        .LRANGE => try handlers.handleLrange(allocator, handler, command_parts),
-        .LLEN => try handlers.handleLlen(handler, command_parts),
-        .LPOP => try handlers.handleLpop(allocator, handler, command_parts),
-        .BLPOP => unreachable,
-        .XADD => blk: {
-            const out = try handlers.handleXadd(allocator, handler, command_parts);
-            try appendNotify(&notify_acc, out.notify);
-            break :blk out.reply;
-        },
-        .XRANGE => try handlers.handleXrange(allocator, handler, command_parts),
-        else => unreachable,
-    };
+    var final = std.ArrayList(WriteOp).init(allocator);
+    errdefer final.deinit();
 
-    const notify_slice: ?[]WriteOp = if (notify_acc.items.len != 0)
-        try notify_acc.toOwnedSlice()
-    else
-        null;
+    const replicas = handler.replicas.items;
+    var args: [64]?[]const u8 = undefined;
+    @memset(args[0..], null);
 
-    return .{ .reply = reply, .notify = notify_slice };
+    args[0] = "MULTI";
+    const multi = try replication.propagateCommand(allocator, replicas, args, 1);
+    try final.appendSlice(multi);
+
+    try final.appendSlice(ops);
+
+    args[0] = "EXEC";
+    const exec = try replication.propagateCommand(allocator, replicas, args, 1);
+    try final.appendSlice(exec);
+
+    return try final.toOwnedSlice();
 }

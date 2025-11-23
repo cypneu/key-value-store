@@ -42,14 +42,15 @@ pub fn main() !void {
     var app_handler = AppHandler.init(allocator, &string_store, &list_store, &stream_store, config.role, config.replica);
     defer app_handler.deinit();
 
-    if (config.role == .replica) {
-        app_handler.startReplication(config.port) catch |err| {
-            log.err("Failed to start replication: {}", .{err});
-        };
-    }
-
     var server_instance = try server.Server(AppHandler).init(&app_handler, "0.0.0.0", config.port, allocator);
     defer server_instance.deinit();
+
+    if (config.role == .replica) {
+        const master = config.replica.?;
+        server_instance.connectToMaster(master.host, master.port, config.port) catch |err| {
+            log.err("Failed to connect to master: {}", .{err});
+        };
+    }
 
     try server_instance.run();
 }

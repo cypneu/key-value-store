@@ -28,6 +28,67 @@ def encode_command(*parts: bytes | str) -> bytes:
     return bytes(out)
 
 
+def read_reply(sock: socket.socket, timeout: float = 2.0):
+    sock.settimeout(timeout)
+    reader = RESPReader()
+    while True:
+        parsed = reader.try_read_one()
+        if parsed is not None:
+            obj, consumed = parsed
+            if consumed:
+                del reader.buf[:consumed]
+            return obj
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError("Connection closed")
+        reader.feed(chunk)
+
+
+class Connection:
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self.reader = RESPReader()
+        self.sock.settimeout(2.0)
+
+    def read_resp(self):
+        while True:
+            parsed = self.reader.try_read_one()
+            if parsed is not None:
+                obj, consumed = parsed
+                if consumed:
+                    del self.reader.buf[:consumed]
+                return obj
+
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("Connection closed")
+            self.reader.feed(chunk)
+
+    def read_rdb(self):
+        while b"\r\n" not in self.reader.buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("Connection closed")
+            self.reader.feed(chunk)
+
+        line, rest_idx = self.reader._read_line(0)
+        if not line.startswith(b"$"):
+            raise ValueError(f"Expected RDB length prefix '$', got {line}")
+
+        length = int(line[1:])
+        del self.reader.buf[:rest_idx]
+
+        while len(self.reader.buf) < length:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("Connection closed")
+            self.reader.feed(chunk)
+
+        data = bytes(self.reader.buf[:length])
+        del self.reader.buf[:length]
+        return data
+
+
 class RESPReader:
     def __init__(self) -> None:
         self.buf = bytearray()
@@ -116,19 +177,3 @@ class RESPReader:
 
     def try_read_one(self):
         return self._parse(0)
-
-
-def read_reply(sock: socket.socket, timeout: float = 2.0):
-    sock.settimeout(timeout)
-    reader = RESPReader()
-    while True:
-        parsed = reader.try_read_one()
-        if parsed is not None:
-            obj, consumed = parsed
-            if consumed:
-                del reader.buf[:consumed]
-            return obj
-        chunk = sock.recv(4096)
-        if not chunk:
-            raise ConnectionError("Connection closed")
-        reader.feed(chunk)

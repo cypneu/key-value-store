@@ -34,5 +34,6 @@ pub fn writeReply(writer: anytype, r: Reply) !void {
             };
             try writer.print("-{s}\r\n", .{msg});
         },
+        .Bytes => |b| try writer.writeAll(b),
     }
 }

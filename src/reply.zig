@@ -17,4 +17,5 @@ pub const Reply = union(enum) {
     Integer: i64,
     Array: ?[]const Reply,
     Error: struct { kind: ErrorKind },
+    Bytes: []const u8,
 };

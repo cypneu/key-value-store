@@ -1,8 +1,6 @@
 const std = @import("std");
 const db = @import("data_structures/mod.zig");
 const dispatcher = @import("dispatcher.zig");
-const posix = std.posix;
-const net = std.net;
 const format = @import("resp/format.zig");
 const Reply = @import("reply.zig").Reply;
 const Command = @import("command.zig").Command;
@@ -11,7 +9,7 @@ const StreamParser = @import("resp/stream_parser.zig").StreamParser;
 const StreamReadRequest = @import("handlers.zig").StreamReadRequest;
 
 pub const WriteOp = struct {
-    fd: std.posix.fd_t,
+    connection_id: u64,
     bytes: []const u8,
 };
 
@@ -29,20 +27,21 @@ pub const IngestResult = union(enum) {
 };
 
 pub const ClientConnection = struct {
-    fd: posix.fd_t,
+    id: u64,
     blocking_key: ?[]const u8,
-    blocking_node: ?*std.DoublyLinkedList(posix.fd_t).Node,
+    blocking_node: ?*std.DoublyLinkedList(u64).Node,
     deadline_us: ?i64,
     blocking_stream_state: ?StreamBlockingState,
     in_transaction: bool,
     transaction_queue: std.ArrayList(TransactionCommand),
+    is_replica: bool,
 
     read_buffer: std.ArrayList(u8),
     read_start: usize,
     parser: StreamParser,
 };
 
-const StreamWaitList = std.DoublyLinkedList(posix.fd_t);
+const StreamWaitList = std.DoublyLinkedList(u64);
 
 const StreamRegistration = struct {
     key: []const u8,
@@ -67,17 +66,20 @@ pub const AppHandler = struct {
     role: ServerRole,
 
     master: ?ReplicaConfig,
-    master_fd: ?posix.fd_t,
+    master_connection_id: ?u64,
 
-    connection_by_fd: std.hash_map.AutoHashMap(posix.fd_t, ClientConnection),
-    blocked_clients_by_key: std.hash_map.StringHashMap(std.DoublyLinkedList(posix.fd_t)),
+    connection_by_id: std.hash_map.AutoHashMap(u64, ClientConnection),
+    blocked_clients_by_key: std.hash_map.StringHashMap(std.DoublyLinkedList(u64)),
     blocked_stream_clients_by_key: std.hash_map.StringHashMap(StreamWaitList),
+    replicas: std.ArrayList(u64),
+
+    next_connection_id: u64,
 
     timeouts: TimeoutQueue,
 
     const TimeoutEntry = struct {
         deadline_us: i64,
-        fd: posix.fd_t,
+        connection_id: u64,
     };
 
     fn timeoutCompare(_: void, a: TimeoutEntry, b: TimeoutEntry) Order {
@@ -94,9 +96,10 @@ pub const AppHandler = struct {
         role: ServerRole,
         master: ?ReplicaConfig,
     ) AppHandler {
-        const connection_by_fd = std.hash_map.AutoHashMap(posix.fd_t, ClientConnection).init(allocator);
-        const blocked_clients_by_key = std.hash_map.StringHashMap(std.DoublyLinkedList(posix.fd_t)).init(allocator);
+        const connection_by_id = std.hash_map.AutoHashMap(u64, ClientConnection).init(allocator);
+        const blocked_clients_by_key = std.hash_map.StringHashMap(std.DoublyLinkedList(u64)).init(allocator);
         const blocked_stream_clients_by_key = std.hash_map.StringHashMap(StreamWaitList).init(allocator);
+        const replicas = std.ArrayList(u64).init(allocator);
         const timeouts = TimeoutQueue.init(allocator, {});
 
         return .{
@@ -106,16 +109,18 @@ pub const AppHandler = struct {
             .stream_store = stream_store,
             .role = role,
             .master = master,
-            .master_fd = null,
-            .connection_by_fd = connection_by_fd,
+            .master_connection_id = null,
+            .connection_by_id = connection_by_id,
             .blocked_clients_by_key = blocked_clients_by_key,
             .blocked_stream_clients_by_key = blocked_stream_clients_by_key,
+            .replicas = replicas,
+            .next_connection_id = 0,
             .timeouts = timeouts,
         };
     }
 
     pub fn deinit(self: *AppHandler) void {
-        var it_conn = self.connection_by_fd.iterator();
+        var it_conn = self.connection_by_id.iterator();
         while (it_conn.next()) |entry| {
             entry.value_ptr.read_buffer.deinit();
             self.clearTransactionQueue(entry.value_ptr);
@@ -131,106 +136,57 @@ pub const AppHandler = struct {
             self.app_allocator.free(entry.key_ptr.*);
         }
         self.blocked_stream_clients_by_key.deinit();
+        self.replicas.deinit();
 
-        if (self.master_fd) |fd| {
-            posix.close(fd);
-        }
         if (self.master) |master| {
             self.app_allocator.free(master.host);
         }
 
-        self.connection_by_fd.deinit();
+        self.connection_by_id.deinit();
         self.timeouts.deinit();
     }
 
-    pub fn startReplication(self: *AppHandler, listening_port: u16) !void {
-        const replica = self.master orelse return;
+    pub fn registerMasterConnection(self: *AppHandler, allocator: std.mem.Allocator, connection_id: u64, listening_port: u16) ![]WriteOp {
+        self.master_connection_id = connection_id;
 
-        var addrs = try net.getAddressList(self.app_allocator, replica.host, replica.port);
-        defer addrs.deinit();
-        if (addrs.addrs.len == 0) return error.InvalidReplicaAddress;
-
-        var connected_fd: ?posix.fd_t = null;
-        var last_err: anyerror = error.ConnectionRefused;
-
-        const socket_type = posix.SOCK.STREAM;
-        const protocol = posix.IPPROTO.TCP;
-
-        for (addrs.addrs) |address| {
-            const fd = posix.socket(address.any.family, socket_type, protocol) catch |err| {
-                last_err = err;
-                continue;
-            };
-
-            const connect_result = posix.connect(fd, &address.any, address.getOsSockLen());
-            if (connect_result) |_| {
-                connected_fd = fd;
-                break;
-            } else |err| {
-                last_err = err;
-                posix.close(fd);
-            }
+        if (self.connection_by_id.getPtr(connection_id)) |conn| {
+            conn.parser.allow_bulk_without_crlf = true;
         }
 
-        const master_fd = connected_fd orelse return last_err;
+        var ops = std.ArrayList(WriteOp).init(allocator);
+        errdefer ops.deinit();
 
-        try self.sendPing(master_fd);
-        try self.sendReplconfListeningPort(master_fd, listening_port);
-        try self.sendReplconfCapa(master_fd);
-        try self.sendPsync(master_fd);
+        try ops.append(.{ .connection_id = connection_id, .bytes = try self.formatCommand(allocator, &[_][]const u8{"PING"}) });
 
-        self.master_fd = master_fd;
-    }
-
-    fn sendPing(self: *AppHandler, fd: posix.fd_t) !void {
-        const parts = [_][]const u8{"PING"};
-        try self.sendCommand(fd, &parts);
-    }
-
-    fn sendReplconfListeningPort(self: *AppHandler, fd: posix.fd_t, listening_port: u16) !void {
         var port_buf: [16]u8 = undefined;
         const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{listening_port});
-        const parts = [_][]const u8{ "REPLCONF", "listening-port", port_str };
-        try self.sendCommand(fd, &parts);
+        try ops.append(.{ .connection_id = connection_id, .bytes = try self.formatCommand(allocator, &[_][]const u8{ "REPLCONF", "listening-port", port_str }) });
+
+        try ops.append(.{ .connection_id = connection_id, .bytes = try self.formatCommand(allocator, &[_][]const u8{ "REPLCONF", "capa", "psync2" }) });
+
+        try ops.append(.{ .connection_id = connection_id, .bytes = try self.formatCommand(allocator, &[_][]const u8{ "PSYNC", "?", "-1" }) });
+
+        return ops.toOwnedSlice();
     }
 
-    fn sendReplconfCapa(self: *AppHandler, fd: posix.fd_t) !void {
-        const parts = [_][]const u8{ "REPLCONF", "capa", "psync2" };
-        try self.sendCommand(fd, &parts);
-    }
-
-    fn sendPsync(self: *AppHandler, fd: posix.fd_t) !void {
-        const parts = [_][]const u8{ "PSYNC", "?", "-1" };
-        try self.sendCommand(fd, &parts);
-    }
-
-    fn sendCommand(self: *AppHandler, fd: posix.fd_t, parts: []const []const u8) !void {
-        var items = try self.app_allocator.alloc(Reply, parts.len);
-        defer self.app_allocator.free(items);
+    fn formatCommand(self: *AppHandler, allocator: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+        _ = self;
+        var items = try allocator.alloc(Reply, parts.len);
+        defer allocator.free(items);
         for (parts, 0..) |part, idx| {
             items[idx] = Reply{ .BulkString = part };
         }
 
         const command = Reply{ .Array = items };
-        var buf = std.ArrayList(u8).init(self.app_allocator);
+        var buf = std.ArrayList(u8).init(allocator);
         defer buf.deinit();
 
         try format.writeReply(buf.writer(), command);
-        try self.writeAll(fd, buf.items);
+        return buf.toOwnedSlice();
     }
 
-    fn writeAll(self: *AppHandler, fd: posix.fd_t, bytes: []const u8) !void {
-        _ = self;
-        var written: usize = 0;
-        while (written < bytes.len) {
-            const bytes_written = try posix.write(fd, bytes[written..]);
-            if (bytes_written == 0) return error.ConnectionClosed;
-            written += bytes_written;
-        }
-    }
-
-    pub fn ingest(self: *AppHandler, client_fd: posix.fd_t, incoming: []const u8, request_allocator: std.mem.Allocator) !IngestResult {
-        const conn = self.connection_by_fd.getPtr(client_fd) orelse return .Close;
+    pub fn ingest(self: *AppHandler, connection_id: u64, incoming: []const u8, request_allocator: std.mem.Allocator) !IngestResult {
+        const conn = self.connection_by_id.getPtr(connection_id) orelse return .Close;
 
         try conn.read_buffer.appendSlice(incoming);
 
@@ -246,7 +202,7 @@ pub const AppHandler = struct {
                     const single = try dispatcher.dispatchCommand(self, request_allocator, done.parts, conn);
                     switch (single) {
                         .Immediate => |value| {
-                            try notifications.append(.{ .fd = client_fd, .bytes = value.bytes });
+                            try notifications.append(.{ .connection_id = connection_id, .bytes = value.bytes });
                             if (value.notify) |ns| try notifications.appendSlice(ns);
                         },
                         .Blocked => {},
@@ -270,24 +226,39 @@ pub const AppHandler = struct {
         return .Blocked;
     }
 
-    pub fn addConnection(self: *AppHandler, client_fd: posix.fd_t) !void {
-        try self.connection_by_fd.put(client_fd, ClientConnection{
-            .fd = client_fd,
+    pub fn createConnection(self: *AppHandler) !u64 {
+        const id = self.next_connection_id;
+        self.next_connection_id += 1;
+
+        try self.connection_by_id.put(id, ClientConnection{
+            .id = id,
             .blocking_key = null,
             .blocking_node = null,
             .deadline_us = null,
             .blocking_stream_state = null,
             .in_transaction = false,
             .transaction_queue = std.ArrayList(TransactionCommand).init(self.app_allocator),
+            .is_replica = false,
             .read_buffer = std.ArrayList(u8).init(self.app_allocator),
             .read_start = 0,
             .parser = StreamParser.init(),
         });
+
+        return id;
     }
 
-    pub fn removeConnection(self: *AppHandler, client_fd: posix.fd_t) void {
-        if (self.connection_by_fd.fetchRemove(client_fd)) |removed_connection| {
+    pub fn removeConnection(self: *AppHandler, connection_id: u64) void {
+        if (self.connection_by_id.fetchRemove(connection_id)) |removed_connection| {
             var conn = removed_connection.value;
+
+            if (conn.is_replica) {
+                for (self.replicas.items, 0..) |r_id, i| {
+                    if (r_id == connection_id) {
+                        _ = self.replicas.orderedRemove(i);
+                        break;
+                    }
+                }
+            }
 
             conn.read_buffer.deinit();
             self.clearTransactionQueue(&conn);
@@ -377,7 +348,7 @@ pub const AppHandler = struct {
         for (requests, 0..) |request, idx| {
             const wait = try self.ensureStreamWaitList(request.key);
             const node_ptr = try self.app_allocator.create(StreamWaitList.Node);
-            node_ptr.* = .{ .data = connection.fd };
+            node_ptr.* = .{ .data = connection.id };
             wait.wait_list.append(node_ptr);
 
             stored_requests[idx] = .{
@@ -401,7 +372,7 @@ pub const AppHandler = struct {
             const delta_us: i64 = @intCast(ms * @as(u64, std.time.us_per_ms));
             const deadline_us = now_us + delta_us;
             connection.deadline_us = deadline_us;
-            try self.timeouts.add(.{ .deadline_us = deadline_us, .fd = connection.fd });
+            try self.timeouts.add(.{ .deadline_us = deadline_us, .connection_id = connection.id });
         } else {
             connection.deadline_us = null;
         }
@@ -422,11 +393,18 @@ pub const AppHandler = struct {
         try self.setStreamBlockDeadline(connection, block_ms);
     }
 
-    pub fn drainWaitersForKey(self: *AppHandler, request_allocator: std.mem.Allocator, key: []const u8, pushed: usize) ![]WriteOp {
-        const wait_list_ptr = self.blocked_clients_by_key.getPtr(key) orelse return &.{};
+    pub const DrainResult = struct {
+        ops: []WriteOp,
+        popped: usize,
+    };
+
+    pub fn drainWaitersForKey(self: *AppHandler, request_allocator: std.mem.Allocator, key: []const u8, pushed: usize) !DrainResult {
+        const wait_list_ptr = self.blocked_clients_by_key.getPtr(key) orelse return .{ .ops = &.{}, .popped = 0 };
 
         var notifications = std.ArrayList(WriteOp).init(request_allocator);
         errdefer notifications.deinit();
+
+        var actual_popped: usize = 0;
 
         for (0..pushed) |_| {
             const node_ptr = wait_list_ptr.popFirst() orelse break;
@@ -436,11 +414,12 @@ pub const AppHandler = struct {
                 wait_list_ptr.prepend(node_ptr);
                 break;
             }
+            actual_popped += 1;
 
-            const fd = node_ptr.data;
+            const id = node_ptr.data;
             defer self.app_allocator.destroy(node_ptr);
 
-            if (self.connection_by_fd.getPtr(fd)) |conn| {
+            if (self.connection_by_id.getPtr(id)) |conn| {
                 conn.blocking_key = null;
                 conn.blocking_node = null;
                 conn.deadline_us = null;
@@ -455,10 +434,10 @@ pub const AppHandler = struct {
             try format.writeReply(buf.writer(), Reply{ .Array = &replies });
             const bytes = try buf.toOwnedSlice();
 
-            try notifications.append(.{ .fd = fd, .bytes = bytes });
+            try notifications.append(.{ .connection_id = id, .bytes = bytes });
         }
 
-        return try notifications.toOwnedSlice();
+        return .{ .ops = try notifications.toOwnedSlice(), .popped = actual_popped };
     }
 
     pub fn expireDueWaiters(self: *AppHandler, now_us: i64, request_allocator: std.mem.Allocator) ![]WriteOp {
@@ -468,9 +447,9 @@ pub const AppHandler = struct {
             if (t.deadline_us > now_us) break;
 
             const entry = self.timeouts.remove();
-            const fd = entry.fd;
+            const id = entry.connection_id;
 
-            if (self.connection_by_fd.getPtr(fd)) |conn| {
+            if (self.connection_by_id.getPtr(id)) |conn| {
                 const maybe_key = conn.blocking_key;
                 const maybe_node = conn.blocking_node;
                 if (maybe_key) |key| {
@@ -488,12 +467,12 @@ pub const AppHandler = struct {
                     var buf = std.ArrayList(u8).init(request_allocator);
                     try format.writeReply(buf.writer(), Reply{ .Array = null });
                     const bytes = try buf.toOwnedSlice();
-                    try notifications.append(.{ .fd = fd, .bytes = bytes });
+                    try notifications.append(.{ .connection_id = id, .bytes = bytes });
                 } else if (conn.blocking_stream_state != null) {
                     var buf = std.ArrayList(u8).init(request_allocator);
                     try format.writeReply(buf.writer(), Reply{ .Array = null });
                     const bytes = try buf.toOwnedSlice();
-                    try notifications.append(.{ .fd = fd, .bytes = bytes });
+                    try notifications.append(.{ .connection_id = id, .bytes = bytes });
                     self.clearStreamBlockingState(conn);
                 }
             }

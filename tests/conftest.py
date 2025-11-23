@@ -4,127 +4,114 @@ import socket
 import subprocess
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
-
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "zig-out" / "bin" / "main"
 _KEY_COUNTER = itertools.count()
-REPLICA_PORT = 6380
 
 
-def _is_port_open(host: str, port: int, timeout: float = 0.1) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
+class RedisServer:
+    def __init__(self, proc: subprocess.Popen, port: int):
+        self.proc = proc
+        self.port = port
+        self.host = "127.0.0.1"
+
+    def client(self, timeout: float = 2.0) -> socket.socket:
+        s = socket.create_connection((self.host, self.port), timeout=timeout)
+        return s
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
 
 
-def _wait_for_port(host: str, port: int, deadline: float) -> None:
-    while time.time() < deadline:
-        if _is_port_open(host, port):
-            return
-        time.sleep(0.02)
-    raise TimeoutError(f"Timed out waiting for {host}:{port} to be ready")
+class RedisCluster(NamedTuple):
+    master: RedisServer
+    replicas: list[RedisServer]
 
 
-def _build_binary() -> None:
+@pytest.fixture(scope="session", autouse=True)
+def build_binary():
     zig = shutil.which("zig")
     if zig is None:
-        pytest.skip("'zig' not found in PATH; cannot build server binary")
+        pytest.skip("'zig' not found in PATH")
     subprocess.run([zig, "build"], cwd=str(ROOT), check=True)
 
 
-@pytest.fixture(scope="session")
-def server_proc():
-    _build_binary()
+@pytest.fixture
+def server_factory():
+    servers: list[RedisServer] = []
 
-    if _is_port_open("127.0.0.1", 6379):
-        pytest.skip("Port 6379 is already in use; cannot run integration tests")
+    def _spawn(args: list[str] = None) -> RedisServer:
+        port = _find_free_port()
+        cmd = [str(BIN), "--port", str(port)] + (args or [])
 
-    proc = subprocess.Popen([str(BIN)], cwd=str(ROOT))
-    try:
-        _wait_for_port("127.0.0.1", 6379, time.time() + 5.0)
-    except Exception:
-        proc.terminate()
+        proc = subprocess.Popen(cmd, cwd=str(ROOT))
+        server = RedisServer(proc, port)
+        servers.append(server)
+
         try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        raise
+            _wait_for_port(server.host, server.port, time.time() + 5.0)
+        except Exception:
+            server.close()
+            raise
 
-    yield proc
+        return server
 
-    if proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+    yield _spawn
+
+    for server in servers:
+        server.close()
 
 
-@pytest.fixture(scope="session")
-def server_proc_replica():
-    _build_binary()
-
-    if _is_port_open("127.0.0.1", REPLICA_PORT):
-        pytest.skip(f"Port {REPLICA_PORT} is already in use; cannot run integration tests")
-
-    proc = subprocess.Popen(
-        [str(BIN), "--port", str(REPLICA_PORT), "--replicaof", "localhost 6379"],
-        cwd=str(ROOT),
-    )
-    try:
-        _wait_for_port("127.0.0.1", REPLICA_PORT, time.time() + 5.0)
-    except Exception:
-        proc.terminate()
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        raise
-
-    yield proc
-
-    if proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+@pytest.fixture
+def master(server_factory) -> RedisServer:
+    return server_factory()
 
 
-@pytest.fixture()
-def conn(server_proc):
-    s = socket.create_connection(("127.0.0.1", 6379), timeout=2.0)
-    try:
-        yield s
-    finally:
-        try:
-            s.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        s.close()
+@pytest.fixture
+def cluster(request, server_factory) -> RedisCluster:
+    config = getattr(request, "param", {})
+    num_replicas = config.get("replicas", 1)
+
+    master_server = server_factory()
+
+    replica_servers = []
+    for _ in range(num_replicas):
+        replica = server_factory(
+            args=["--replicaof", f"{master_server.host} {master_server.port}"]
+        )
+        replica_servers.append(replica)
+
+    return RedisCluster(master=master_server, replicas=replica_servers)
 
 
-@pytest.fixture()
-def conn_replica(server_proc_replica):
-    s = socket.create_connection(("127.0.0.1", REPLICA_PORT), timeout=2.0)
-    try:
-        yield s
-    finally:
-        try:
-            s.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        s.close()
-
-
-@pytest.fixture()
+@pytest.fixture
 def make_key():
     def _factory(prefix: str) -> str:
         return f"t_{prefix}_{next(_KEY_COUNTER)}"
 
     return _factory
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _wait_for_port(host: str, port: int, deadline: float) -> None:
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.1):
+                return
+        except OSError:
+            time.sleep(0.02)
+    raise TimeoutError(f"Timed out waiting for {host}:{port} to be ready")
