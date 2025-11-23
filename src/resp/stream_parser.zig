@@ -11,9 +11,11 @@ pub const StreamParser = struct {
         Overflow,
     };
 
+    pub const MessageKind = enum { Array, SimpleString, TopLevelBulk };
+
     pub const ParseResult = union(enum) {
         NeedMore,
-        Done: struct { consumed: usize, parts: [max_parts]?[]const u8 },
+        Done: struct { consumed: usize, parts: [max_parts]?[]const u8, kind: MessageKind },
         Error: Error,
     };
 
@@ -36,10 +38,8 @@ pub const StreamParser = struct {
         SimpleStringLF,
     };
 
-    const Mode = enum { Array, SimpleString, TopLevelBulk };
-
     state: State = .ExpectStart,
-    mode: Mode = .Array,
+    mode: MessageKind = .Array,
     cursor: usize = 0,
 
     array_len: usize = 0,
@@ -323,6 +323,7 @@ pub const StreamParser = struct {
 
     fn finishMessage(self: *StreamParser, buf: []const u8, consumed: usize) ParseResult {
         const count = self.args_count;
+        const kind = self.mode;
         var parts: [max_parts]?[]const u8 = .{null} ** max_parts;
         var idx: usize = 0;
         while (idx < count) : (idx += 1) {
@@ -336,7 +337,7 @@ pub const StreamParser = struct {
         self.array_len = 0;
         self.bulk_remaining = 0;
         self.clearArgState();
-        return .{ .Done = .{ .consumed = consumed, .parts = parts } };
+        return .{ .Done = .{ .consumed = consumed, .parts = parts, .kind = kind } };
     }
 
     pub fn init() StreamParser {

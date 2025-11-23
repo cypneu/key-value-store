@@ -135,17 +135,26 @@ def test_replica_responds_to_getack(server_factory):
             assert replica.read_resp()[0] == "PSYNC"
             conn.sendall(b"+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990ae25 0\r\n")
 
-            empty_rdb = bytes.fromhex("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bf220215a")
+            empty_rdb = bytes.fromhex(
+                "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bf220215a"
+            )
             conn.sendall(b"$" + str(len(empty_rdb)).encode() + b"\r\n" + empty_rdb)
 
-            # Send REPLCONF GETACK *
             conn.sendall(encode_command("REPLCONF", "GETACK", "*"))
+            assert replica.read_resp() == ["REPLCONF", "ACK", "0"]
 
-            # Expect REPLCONF ACK 0
-            response = replica.read_resp()
-            assert response == ["REPLCONF", "ACK", "0"]
+            conn.sendall(encode_command("PING"))
 
-        
+            conn.sendall(encode_command("REPLCONF", "GETACK", "*"))
+            assert replica.read_resp() == ["REPLCONF", "ACK", "51"]
+
+            conn.sendall(encode_command("SET", "foo", "1"))
+            conn.sendall(encode_command("SET", "bar", "2"))
+
+            conn.sendall(encode_command("REPLCONF", "GETACK", "*"))
+            assert replica.read_resp() == ["REPLCONF", "ACK", "146"]
+
+
 def test_replica_processes_propagated_commands(cluster):
     master = cluster.master
     replica = cluster.replicas[0]

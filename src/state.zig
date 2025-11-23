@@ -67,6 +67,7 @@ pub const AppHandler = struct {
 
     master: ?ReplicaConfig,
     master_connection_id: ?u64,
+    replication_offset: u64,
 
     connection_by_id: std.hash_map.AutoHashMap(u64, ClientConnection),
     blocked_clients_by_key: std.hash_map.StringHashMap(std.DoublyLinkedList(u64)),
@@ -110,6 +111,7 @@ pub const AppHandler = struct {
             .role = role,
             .master = master,
             .master_connection_id = null,
+            .replication_offset = 0,
             .connection_by_id = connection_by_id,
             .blocked_clients_by_key = blocked_clients_by_key,
             .blocked_stream_clients_by_key = blocked_stream_clients_by_key,
@@ -148,6 +150,7 @@ pub const AppHandler = struct {
 
     pub fn registerMasterConnection(self: *AppHandler, allocator: std.mem.Allocator, connection_id: u64, listening_port: u16) ![]WriteOp {
         self.master_connection_id = connection_id;
+        self.replication_offset = 0;
 
         if (self.connection_by_id.getPtr(connection_id)) |conn| {
             conn.parser.allow_bulk_without_crlf = true;
@@ -185,6 +188,24 @@ pub const AppHandler = struct {
         return buf.toOwnedSlice();
     }
 
+    fn isMasterConnection(self: *AppHandler, connection_id: u64) bool {
+        return self.master_connection_id != null and self.master_connection_id.? == connection_id;
+    }
+
+    fn updateReplicationOffset(
+        self: *AppHandler,
+        connection_id: u64,
+        message_kind: StreamParser.MessageKind,
+        consumed: usize,
+    ) void {
+        if (self.role != .replica) return;
+        if (!self.isMasterConnection(connection_id)) return;
+
+        if (message_kind == .Array) {
+            self.replication_offset += @intCast(consumed);
+        }
+    }
+
     pub fn ingest(self: *AppHandler, connection_id: u64, incoming: []const u8, request_allocator: std.mem.Allocator) !IngestResult {
         const conn = self.connection_by_id.getPtr(connection_id) orelse return .Close;
 
@@ -207,6 +228,8 @@ pub const AppHandler = struct {
                         },
                         .Blocked => {},
                     }
+
+                    self.updateReplicationOffset(connection_id, done.kind, done.consumed);
 
                     conn.read_start += done.consumed;
                     conn.parser.reset();
@@ -250,6 +273,11 @@ pub const AppHandler = struct {
     pub fn removeConnection(self: *AppHandler, connection_id: u64) void {
         if (self.connection_by_id.fetchRemove(connection_id)) |removed_connection| {
             var conn = removed_connection.value;
+
+            if (self.master_connection_id != null and self.master_connection_id.? == connection_id) {
+                self.master_connection_id = null;
+                self.replication_offset = 0;
+            }
 
             if (conn.is_replica) {
                 for (self.replicas.items, 0..) |r_id, i| {

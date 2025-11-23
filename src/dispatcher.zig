@@ -111,7 +111,7 @@ fn executeCommand(
             break :blk .{ .reply = out.reply, .notify = out.notify };
         },
         .XRANGE => .{ .reply = try handlers.handleXrange(allocator, handler, command_parts), .notify = &.{} },
-        .REPLCONF => .{ .reply = try handlers.handleReplconf(allocator, command_parts), .notify = &.{} },
+        .REPLCONF => .{ .reply = try handlers.handleReplconf(allocator, handler, command_parts), .notify = &.{} },
         .PSYNC => .{ .reply = try handlers.handlePsync(allocator, handler, client_connection, command_parts), .notify = &.{} },
         else => unreachable,
     };
