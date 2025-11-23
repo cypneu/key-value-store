@@ -294,11 +294,12 @@ fn tryImmediateBlpop(allocator: std.mem.Allocator, handler: *AppHandler, key: []
     args[0] = "LPOP";
     args[1] = key;
 
-    const notify = try replication.propagateCommand(allocator, handler.replicas.items, args, 2);
+    const prop = try replication.propagateCommand(allocator, handler.replicas.items, args, 2);
+    handler.recordPropagation(prop.bytes_len);
 
     return CommandOutcome{
         .reply = reply,
-        .notify = notify,
+        .notify = prop.ops,
     };
 }
 
@@ -357,6 +358,70 @@ pub fn handleType(handler: *AppHandler, args: [64]?[]const u8) !Reply {
     if (handler.stream_store.contains(key)) return Reply{ .SimpleString = "stream" };
 
     return Reply{ .SimpleString = "none" };
+}
+
+pub fn handleWait(
+    allocator: std.mem.Allocator,
+    handler: *AppHandler,
+    client_connection: *ClientConnection,
+    args: [64]?[]const u8,
+) !union(enum) { Value: Reply, Blocked: struct { notify: ?[]WriteOp } } {
+    if (argumentCount(args) != 3) {
+        return .{ .Value = Reply{ .Error = .{ .kind = ErrorKind.ArgNum } } };
+    }
+
+    const replicas_needed_slice = args[1].?;
+    const timeout_slice = args[2].?;
+
+    const replicas_needed = std.fmt.parseInt(i64, replicas_needed_slice, 10) catch return .{ .Value = Reply{ .Error = .{ .kind = ErrorKind.NotInteger } } };
+    const timeout_ms = std.fmt.parseInt(i64, timeout_slice, 10) catch return .{ .Value = Reply{ .Error = .{ .kind = ErrorKind.NotInteger } } };
+
+    if (replicas_needed < 0 or timeout_ms < 0) return .{ .Value = Reply{ .Error = .{ .kind = ErrorKind.NotInteger } } };
+
+    const target_offset = handler.replication_offset;
+    const required: u64 = @intCast(replicas_needed);
+
+    var replica_ids_buffer = std.ArrayList(u64).init(allocator);
+    defer replica_ids_buffer.deinit();
+
+    if (handler.replicas.items.len == 0) {
+        var it = handler.connection_by_id.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.is_replica) {
+                try replica_ids_buffer.append(entry.value_ptr.id);
+            }
+        }
+    }
+
+    const replica_ids = if (handler.replicas.items.len != 0) handler.replicas.items else replica_ids_buffer.items;
+
+    const total_replicas: u64 = @intCast(replica_ids.len);
+
+    var acked_count: u64 = 0;
+    for (replica_ids) |rid| {
+        const ack = handler.replicaAck(rid);
+        if (ack >= target_offset) {
+            acked_count += 1;
+        }
+    }
+    const acked = acked_count;
+
+    if (acked >= required or total_replicas == 0 or acked == total_replicas or timeout_ms == 0) {
+        return .{ .Value = Reply{ .Integer = @intCast(acked) } };
+    }
+
+    var args_buf: [64]?[]const u8 = undefined;
+    @memset(args_buf[0..], null);
+    args_buf[0] = "REPLCONF";
+    args_buf[1] = "GETACK";
+    args_buf[2] = "*";
+
+    const prop = try replication.propagateCommand(allocator, replica_ids, args_buf, 3);
+    handler.recordPropagation(prop.bytes_len);
+
+    try handler.registerWait(client_connection, required, @intCast(timeout_ms));
+
+    return .{ .Blocked = .{ .notify = prop.ops } };
 }
 
 fn calculateExpiration(ttl_ms: u64) i64 {
@@ -459,8 +524,9 @@ fn handlePush(comptime is_left: bool, allocator: std.mem.Allocator, handler: *Ap
             arg_count = 3;
         }
 
-        const lpop_notify = try replication.propagateCommand(allocator, handler.replicas.items, lpop_args, arg_count);
-        try notify_list.appendSlice(lpop_notify);
+        const prop = try replication.propagateCommand(allocator, handler.replicas.items, lpop_args, arg_count);
+        handler.recordPropagation(prop.bytes_len);
+        try notify_list.appendSlice(prop.ops);
     }
 
     return .{
@@ -676,6 +742,7 @@ pub fn handlePsync(allocator: std.mem.Allocator, handler: *AppHandler, connectio
     if (!connection.is_replica) {
         connection.is_replica = true;
         try handler.replicas.append(connection.id);
+        try handler.replica_acks.put(connection.id, 0);
     }
 
     return Reply{ .Bytes = try buf.toOwnedSlice() };

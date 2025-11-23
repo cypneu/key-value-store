@@ -9,13 +9,18 @@ pub fn isReplicationCommand(command: Command) bool {
     };
 }
 
+pub const Propagation = struct {
+    ops: []WriteOp,
+    bytes_len: usize,
+};
+
 pub fn propagateCommand(
     allocator: std.mem.Allocator,
     replicas: []const u64,
     command_parts: [64]?[]const u8,
     part_count: usize,
-) ![]WriteOp {
-    if (replicas.len == 0) return &.{};
+) !Propagation {
+    if (replicas.len == 0) return .{ .ops = &.{}, .bytes_len = 0 };
 
     var buf = std.ArrayList(u8).init(allocator);
     defer buf.deinit();
@@ -28,6 +33,7 @@ pub fn propagateCommand(
 
     const command_bytes = try buf.toOwnedSlice();
     errdefer allocator.free(command_bytes);
+    const bytes_len = command_bytes.len;
 
     var ops = try allocator.alloc(WriteOp, replicas.len);
     errdefer allocator.free(ops);
@@ -40,5 +46,5 @@ pub fn propagateCommand(
     }
 
     allocator.free(command_bytes);
-    return ops;
+    return .{ .ops = ops, .bytes_len = bytes_len };
 }

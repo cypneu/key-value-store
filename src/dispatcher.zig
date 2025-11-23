@@ -12,7 +12,7 @@ const replication = @import("replication.zig");
 
 pub const ProcessResult = union(enum) {
     Immediate: struct { bytes: []const u8, notify: ?[]WriteOp },
-    Blocked,
+    Blocked: struct { notify: ?[]WriteOp },
 };
 
 const ImmediateCommandResult = struct {
@@ -37,19 +37,32 @@ pub fn dispatchCommand(handler: *AppHandler, request_allocator: std.mem.Allocato
         return makeImmediate(bytes, null);
     };
 
+    if (command == .REPLCONF and command_parts[1] != null and std.ascii.eqlIgnoreCase(command_parts[1].?, "ACK")) {
+        const offset = std.fmt.parseInt(u64, command_parts[2] orelse "0", 10) catch 0;
+        const notify = try handler.recordReplicaAck(request_allocator, client_connection.id, offset);
+        return ProcessResult{ .Immediate = .{ .bytes = &[_]u8{}, .notify = notify } };
+    }
+
     const result = switch (command) {
         .BLPOP => blk: {
             const blpop_result = try handlers.handleBlpop(request_allocator, handler, client_connection, command_parts);
             break :blk switch (blpop_result) {
                 .Value => |outcome| makeImmediate(try renderReply(request_allocator, outcome.reply), outcome.notify),
-                .Blocked => ProcessResult.Blocked,
+                .Blocked => ProcessResult{ .Blocked = .{ .notify = null } },
             };
         },
         .XREAD => blk: {
             const xread_result = try handlers.handleXread(request_allocator, handler, client_connection, command_parts);
             break :blk switch (xread_result) {
                 .Value => |reply| makeImmediate(try renderReply(request_allocator, reply), null),
-                .Blocked => ProcessResult.Blocked,
+                .Blocked => ProcessResult{ .Blocked = .{ .notify = null } },
+            };
+        },
+        .WAIT => blk: {
+            const wait_result = try handlers.handleWait(request_allocator, handler, client_connection, command_parts);
+            break :blk switch (wait_result) {
+                .Value => |reply| makeImmediate(try renderReply(request_allocator, reply), null),
+                .Blocked => |blocked| ProcessResult{ .Blocked = .{ .notify = blocked.notify } },
             };
         },
         else => blk: {
@@ -72,7 +85,7 @@ pub fn dispatchCommand(handler: *AppHandler, request_allocator: std.mem.Allocato
                 .Immediate => |imm| {
                     return ProcessResult{ .Immediate = .{ .bytes = &[_]u8{}, .notify = imm.notify } };
                 },
-                .Blocked => return result,
+                .Blocked => |blk| return ProcessResult{ .Blocked = .{ .notify = blk.notify } },
             }
         }
     }
@@ -141,8 +154,9 @@ fn collectNotifications(
 
     if (replication.isReplicationCommand(command) and !replyIsError(result.reply)) {
         const part_count = countCommandParts(command_parts);
-        const replicas = try replication.propagateCommand(allocator, handler.replicas.items, command_parts, part_count);
-        try appendNotify(&notifications, replicas);
+        const prop = try replication.propagateCommand(allocator, handler.replicas.items, command_parts, part_count);
+        handler.recordPropagation(prop.bytes_len);
+        try appendNotify(&notifications, prop.ops);
     }
 
     try appendNotify(&notifications, result.notify);
@@ -316,13 +330,15 @@ fn wrapInMultiExec(
 
     args[0] = "MULTI";
     const multi = try replication.propagateCommand(allocator, replicas, args, 1);
-    try final.appendSlice(multi);
+    handler.recordPropagation(multi.bytes_len);
+    try final.appendSlice(multi.ops);
 
     try final.appendSlice(ops);
 
     args[0] = "EXEC";
     const exec = try replication.propagateCommand(allocator, replicas, args, 1);
-    try final.appendSlice(exec);
+    handler.recordPropagation(exec.bytes_len);
+    try final.appendSlice(exec.ops);
 
     return try final.toOwnedSlice();
 }

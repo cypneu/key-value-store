@@ -32,6 +32,7 @@ pub const ClientConnection = struct {
     blocking_node: ?*std.DoublyLinkedList(u64).Node,
     deadline_us: ?i64,
     blocking_stream_state: ?StreamBlockingState,
+    wait_state: ?WaitState,
     in_transaction: bool,
     transaction_queue: std.ArrayList(TransactionCommand),
     is_replica: bool,
@@ -51,6 +52,17 @@ const StreamRegistration = struct {
 const StreamBlockingState = struct {
     requests: []StreamReadRequest,
     registrations: []StreamRegistration,
+};
+
+const WaitState = struct {
+    required: u64,
+    target_offset: u64,
+};
+
+const WaitRegistration = struct {
+    connection_id: u64,
+    required: u64,
+    target_offset: u64,
 };
 
 pub const TransactionCommand = struct {
@@ -73,6 +85,8 @@ pub const AppHandler = struct {
     blocked_clients_by_key: std.hash_map.StringHashMap(std.DoublyLinkedList(u64)),
     blocked_stream_clients_by_key: std.hash_map.StringHashMap(StreamWaitList),
     replicas: std.ArrayList(u64),
+    replica_acks: std.hash_map.AutoHashMap(u64, u64),
+    waiters: std.ArrayList(WaitRegistration),
 
     next_connection_id: u64,
 
@@ -116,6 +130,8 @@ pub const AppHandler = struct {
             .blocked_clients_by_key = blocked_clients_by_key,
             .blocked_stream_clients_by_key = blocked_stream_clients_by_key,
             .replicas = replicas,
+            .replica_acks = std.hash_map.AutoHashMap(u64, u64).init(allocator),
+            .waiters = std.ArrayList(WaitRegistration).init(allocator),
             .next_connection_id = 0,
             .timeouts = timeouts,
         };
@@ -139,6 +155,8 @@ pub const AppHandler = struct {
         }
         self.blocked_stream_clients_by_key.deinit();
         self.replicas.deinit();
+        self.replica_acks.deinit();
+        self.waiters.deinit();
 
         if (self.master) |master| {
             self.app_allocator.free(master.host);
@@ -188,6 +206,119 @@ pub const AppHandler = struct {
         return buf.toOwnedSlice();
     }
 
+    pub fn recordPropagation(self: *AppHandler, bytes_len: usize) void {
+        if (self.role != .master) return;
+        if (self.replicas.items.len == 0) return;
+        self.replication_offset += @intCast(bytes_len);
+    }
+
+    pub fn replicaAck(self: *AppHandler, replica_id: u64) u64 {
+        return self.replica_acks.get(replica_id) orelse 0;
+    }
+
+    pub fn countReplicasAtOrBeyond(self: *AppHandler, target_offset: u64) usize {
+        var count: usize = 0;
+        for (self.replicas.items) |replica_id| {
+            if (self.replicaAck(replica_id) >= target_offset) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    fn renderIntegerReply(allocator: std.mem.Allocator, value: usize) ![]u8 {
+        var buf = std.ArrayList(u8).init(allocator);
+        errdefer buf.deinit();
+        try format.writeReply(buf.writer(), Reply{ .Integer = @intCast(value) });
+        return try buf.toOwnedSlice();
+    }
+
+    fn finishWait(_: *AppHandler, conn: *ClientConnection) void {
+        conn.wait_state = null;
+        conn.deadline_us = null;
+    }
+
+    fn findWaiterIndex(self: *AppHandler, connection_id: u64) ?usize {
+        var idx: usize = 0;
+        while (idx < self.waiters.items.len) : (idx += 1) {
+            if (self.waiters.items[idx].connection_id == connection_id) return idx;
+        }
+        return null;
+    }
+
+    fn removeWaiterAt(self: *AppHandler, idx: usize) void {
+        const removed = self.waiters.swapRemove(idx);
+        if (self.connection_by_id.getPtr(removed.connection_id)) |conn| {
+            self.finishWait(conn);
+        }
+    }
+
+    fn removeWaiterByConnection(self: *AppHandler, connection_id: u64) void {
+        if (self.findWaiterIndex(connection_id)) |idx| {
+            self.removeWaiterAt(idx);
+        }
+    }
+
+    fn respondSatisfiedWaits(self: *AppHandler, allocator: std.mem.Allocator) !?[]WriteOp {
+        var notifications = std.ArrayList(WriteOp).init(allocator);
+        errdefer notifications.deinit();
+
+        var idx: usize = self.waiters.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            const wait = self.waiters.items[idx];
+            const acked = self.countReplicasAtOrBeyond(wait.target_offset);
+            const total = self.replicas.items.len;
+            if (@as(u64, @intCast(acked)) >= wait.required or acked == total) {
+                const bytes = try renderIntegerReply(allocator, acked);
+                try notifications.append(.{ .connection_id = wait.connection_id, .bytes = bytes });
+                self.removeWaiterAt(idx);
+            }
+        }
+
+        if (notifications.items.len == 0) return null;
+        return try notifications.toOwnedSlice();
+    }
+
+    pub fn recordReplicaAck(
+        self: *AppHandler,
+        request_allocator: std.mem.Allocator,
+        replica_id: u64,
+        offset: u64,
+    ) !?[]WriteOp {
+        if (self.role != .master) return null;
+        const current = self.replica_acks.get(replica_id) orelse 0;
+        const updated = if (offset > current) offset else current;
+        try self.replica_acks.put(replica_id, updated);
+        return try self.respondSatisfiedWaits(request_allocator);
+    }
+
+    pub fn registerWait(
+        self: *AppHandler,
+        connection: *ClientConnection,
+        required: u64,
+        timeout_ms: u64,
+    ) !void {
+        connection.wait_state = .{
+            .required = required,
+            .target_offset = self.replication_offset,
+        };
+        try self.waiters.append(.{
+            .connection_id = connection.id,
+            .required = required,
+            .target_offset = self.replication_offset,
+        });
+
+        if (timeout_ms > 0) {
+            const now_us: i64 = std.time.microTimestamp();
+            const deadline_us: i64 = now_us + @as(i64, @intCast(timeout_ms)) * @as(i64, std.time.us_per_ms);
+            connection.deadline_us = deadline_us;
+            try self.timeouts.add(.{ .deadline_us = deadline_us, .connection_id = connection.id });
+        } else {
+            connection.deadline_us = null;
+        }
+    }
+
     fn isMasterConnection(self: *AppHandler, connection_id: u64) bool {
         return self.master_connection_id != null and self.master_connection_id.? == connection_id;
     }
@@ -223,10 +354,14 @@ pub const AppHandler = struct {
                     const single = try dispatcher.dispatchCommand(self, request_allocator, done.parts, conn);
                     switch (single) {
                         .Immediate => |value| {
-                            try notifications.append(.{ .connection_id = connection_id, .bytes = value.bytes });
+                            if (value.bytes.len != 0) {
+                                try notifications.append(.{ .connection_id = connection_id, .bytes = value.bytes });
+                            }
                             if (value.notify) |ns| try notifications.appendSlice(ns);
                         },
-                        .Blocked => {},
+                        .Blocked => |blk| {
+                            if (blk.notify) |ns| try notifications.appendSlice(ns);
+                        },
                     }
 
                     self.updateReplicationOffset(connection_id, done.kind, done.consumed);
@@ -259,6 +394,7 @@ pub const AppHandler = struct {
             .blocking_node = null,
             .deadline_us = null,
             .blocking_stream_state = null,
+            .wait_state = null,
             .in_transaction = false,
             .transaction_queue = std.ArrayList(TransactionCommand).init(self.app_allocator),
             .is_replica = false,
@@ -274,6 +410,10 @@ pub const AppHandler = struct {
         if (self.connection_by_id.fetchRemove(connection_id)) |removed_connection| {
             var conn = removed_connection.value;
 
+            if (conn.wait_state != null) {
+                self.removeWaiterByConnection(connection_id);
+            }
+
             if (self.master_connection_id != null and self.master_connection_id.? == connection_id) {
                 self.master_connection_id = null;
                 self.replication_offset = 0;
@@ -286,6 +426,7 @@ pub const AppHandler = struct {
                         break;
                     }
                 }
+                _ = self.replica_acks.remove(connection_id);
             }
 
             conn.read_buffer.deinit();
@@ -502,6 +643,19 @@ pub const AppHandler = struct {
                     const bytes = try buf.toOwnedSlice();
                     try notifications.append(.{ .connection_id = id, .bytes = bytes });
                     self.clearStreamBlockingState(conn);
+                } else if (conn.wait_state) |_| {
+                    if (self.findWaiterIndex(id)) |idx| {
+                        const wait = self.waiters.items[idx];
+                        const acked = self.countReplicasAtOrBeyond(wait.target_offset);
+                        const total = self.replicas.items.len;
+                        const final = if (acked < total) total else acked;
+                        const bytes = try renderIntegerReply(request_allocator, final);
+                        try notifications.append(.{ .connection_id = id, .bytes = bytes });
+                        self.removeWaiterAt(idx);
+                    } else {
+                        conn.wait_state = null;
+                        conn.deadline_us = null;
+                    }
                 }
             }
         }
