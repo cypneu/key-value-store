@@ -638,8 +638,17 @@ pub fn handleBlpop(allocator: std.mem.Allocator, handler: *AppHandler, client_co
     return .Blocked;
 }
 
-pub fn handleReplconf(args: [64]?[]const u8) !Reply {
-    _ = args;
+pub fn handleReplconf(allocator: std.mem.Allocator, args: [64]?[]const u8) !Reply {
+    const subcommand = args[1] orelse return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
+
+    if (std.ascii.eqlIgnoreCase(subcommand, "GETACK")) {
+        var reply_args = try allocator.alloc(Reply, 3);
+        reply_args[0] = Reply{ .BulkString = "REPLCONF" };
+        reply_args[1] = Reply{ .BulkString = "ACK" };
+        reply_args[2] = Reply{ .BulkString = "0" };
+        return Reply{ .Array = reply_args };
+    }
+
     return Reply{ .SimpleString = "OK" };
 }
 

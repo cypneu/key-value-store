@@ -60,11 +60,20 @@ pub fn dispatchCommand(handler: *AppHandler, request_allocator: std.mem.Allocato
     };
 
     if (is_from_master) {
-        switch (result) {
-            .Immediate => |imm| {
-                return ProcessResult{ .Immediate = .{ .bytes = &[_]u8{}, .notify = imm.notify } };
-            },
-            .Blocked => return result,
+        var allow_reply = false;
+        if (command == .REPLCONF and command_parts[1] != null) {
+            if (std.ascii.eqlIgnoreCase(command_parts[1].?, "GETACK")) {
+                allow_reply = true;
+            }
+        }
+
+        if (!allow_reply) {
+            switch (result) {
+                .Immediate => |imm| {
+                    return ProcessResult{ .Immediate = .{ .bytes = &[_]u8{}, .notify = imm.notify } };
+                },
+                .Blocked => return result,
+            }
         }
     }
 
@@ -102,7 +111,7 @@ fn executeCommand(
             break :blk .{ .reply = out.reply, .notify = out.notify };
         },
         .XRANGE => .{ .reply = try handlers.handleXrange(allocator, handler, command_parts), .notify = &.{} },
-        .REPLCONF => .{ .reply = try handlers.handleReplconf(command_parts), .notify = &.{} },
+        .REPLCONF => .{ .reply = try handlers.handleReplconf(allocator, command_parts), .notify = &.{} },
         .PSYNC => .{ .reply = try handlers.handlePsync(allocator, handler, client_connection, command_parts), .notify = &.{} },
         else => unreachable,
     };

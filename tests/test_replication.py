@@ -108,6 +108,43 @@ def test_master_propagates_rpush_blpop_order(master):
         resp2 = replica.read_resp()
         assert resp2 == ["LPOP", "key"]
 
+
+def test_replica_responds_to_getack(server_factory):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as master_sock:
+        master_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        master_sock.bind(("127.0.0.1", 0))
+        master_sock.listen(1)
+        port = master_sock.getsockname()[1]
+
+        server_factory(args=["--replicaof", f"127.0.0.1 {port}"])
+
+        conn, _ = master_sock.accept()
+        with conn:
+            replica = Connection(conn)
+
+            # Handshake
+            assert replica.read_resp() == ["PING"]
+            conn.sendall(b"+PONG\r\n")
+
+            assert replica.read_resp()[0] == "REPLCONF"
+            conn.sendall(b"+OK\r\n")
+
+            assert replica.read_resp()[0] == "REPLCONF"
+            conn.sendall(b"+OK\r\n")
+
+            assert replica.read_resp()[0] == "PSYNC"
+            conn.sendall(b"+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990ae25 0\r\n")
+
+            empty_rdb = bytes.fromhex("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bf220215a")
+            conn.sendall(b"$" + str(len(empty_rdb)).encode() + b"\r\n" + empty_rdb)
+
+            # Send REPLCONF GETACK *
+            conn.sendall(encode_command("REPLCONF", "GETACK", "*"))
+
+            # Expect REPLCONF ACK 0
+            response = replica.read_resp()
+            assert response == ["REPLCONF", "ACK", "0"]
+
         
 def test_replica_processes_propagated_commands(cluster):
     master = cluster.master
