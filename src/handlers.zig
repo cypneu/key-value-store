@@ -747,3 +747,27 @@ pub fn handlePsync(allocator: std.mem.Allocator, handler: *AppHandler, connectio
 
     return Reply{ .Bytes = try buf.toOwnedSlice() };
 }
+
+pub fn handleConfig(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !Reply {
+    const subcommand = args[1] orelse return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
+
+    if (std.ascii.eqlIgnoreCase(subcommand, "GET")) {
+        const param = args[2] orelse return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
+
+        if (std.ascii.eqlIgnoreCase(param, "dir")) {
+            var arr = try allocator.alloc(Reply, 2);
+            arr[0] = Reply{ .BulkString = "dir" };
+            arr[1] = Reply{ .BulkString = handler.dir };
+            return Reply{ .Array = arr };
+        } else if (std.ascii.eqlIgnoreCase(param, "dbfilename")) {
+            var arr = try allocator.alloc(Reply, 2);
+            arr[0] = Reply{ .BulkString = "dbfilename" };
+            arr[1] = Reply{ .BulkString = handler.db_filename };
+            return Reply{ .Array = arr };
+        } else {
+            return Reply{ .Array = &[_]Reply{} };
+        }
+    }
+
+    return Reply{ .Error = .{ .kind = ErrorKind.Syntax } };
+}

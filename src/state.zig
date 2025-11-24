@@ -76,6 +76,8 @@ pub const AppHandler = struct {
     list_store: *db.ListStore,
     stream_store: *db.StreamStore,
     role: ServerRole,
+    dir: []const u8,
+    db_filename: []const u8,
 
     master: ?ReplicaConfig,
     master_connection_id: ?u64,
@@ -110,6 +112,8 @@ pub const AppHandler = struct {
         stream_store: *db.StreamStore,
         role: ServerRole,
         master: ?ReplicaConfig,
+        dir: []const u8,
+        db_filename: []const u8,
     ) AppHandler {
         const connection_by_id = std.hash_map.AutoHashMap(u64, ClientConnection).init(allocator);
         const blocked_clients_by_key = std.hash_map.StringHashMap(std.DoublyLinkedList(u64)).init(allocator);
@@ -123,6 +127,8 @@ pub const AppHandler = struct {
             .list_store = list_store,
             .stream_store = stream_store,
             .role = role,
+            .dir = dir,
+            .db_filename = db_filename,
             .master = master,
             .master_connection_id = null,
             .replication_offset = 0,
@@ -161,6 +167,9 @@ pub const AppHandler = struct {
         if (self.master) |master| {
             self.app_allocator.free(master.host);
         }
+
+        self.app_allocator.free(self.dir);
+        self.app_allocator.free(self.db_filename);
 
         self.connection_by_id.deinit();
         self.timeouts.deinit();

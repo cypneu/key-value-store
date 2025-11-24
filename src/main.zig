@@ -39,7 +39,7 @@ pub fn main() !void {
     var stream_store = db.StreamStore.init(allocator);
     defer stream_store.deinit();
 
-    var app_handler = AppHandler.init(allocator, &string_store, &list_store, &stream_store, config.role, config.replica);
+    var app_handler = AppHandler.init(allocator, &string_store, &list_store, &stream_store, config.role, config.replica, config.dir, config.db_filename);
     defer app_handler.deinit();
 
     var server_instance = try server.Server(AppHandler).init(&app_handler, "0.0.0.0", config.port, allocator);
@@ -55,7 +55,7 @@ pub fn main() !void {
     try server_instance.run();
 }
 
-const Config = struct { port: u16, role: ServerRole, replica: ?ReplicaConfig };
+const Config = struct { port: u16, role: ServerRole, replica: ?ReplicaConfig, dir: []const u8, db_filename: []const u8 };
 
 fn parseConfig(allocator: std.mem.Allocator) !Config {
     var args = try std.process.argsWithAllocator(allocator);
@@ -66,6 +66,9 @@ fn parseConfig(allocator: std.mem.Allocator) !Config {
     var port: u16 = DEFAULT_PORT;
     var role: ServerRole = .master;
     var replica: ?ReplicaConfig = null;
+    var dir: ?[]const u8 = null;
+    var db_filename: ?[]const u8 = null;
+
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--port")) {
             const value = args.next() orelse return error.MissingPortValue;
@@ -82,8 +85,20 @@ fn parseConfig(allocator: std.mem.Allocator) !Config {
 
             role = .replica;
             replica = .{ .host = host_copy, .port = replica_port };
+        } else if (std.mem.eql(u8, arg, "--dir")) {
+            const value = args.next() orelse return error.MissingDirValue;
+            dir = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, arg, "--dbfilename")) {
+            const value = args.next() orelse return error.MissingDbFilenameValue;
+            db_filename = try allocator.dupe(u8, value);
         }
     }
 
-    return .{ .port = port, .role = role, .replica = replica };
+    return .{
+        .port = port,
+        .role = role,
+        .replica = replica,
+        .dir = dir orelse try allocator.dupe(u8, "."),
+        .db_filename = db_filename orelse try allocator.dupe(u8, "dump.rdb"),
+    };
 }
