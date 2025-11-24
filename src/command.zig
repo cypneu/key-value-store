@@ -24,6 +24,7 @@ pub const Command = enum {
     PSYNC,
     WAIT,
     CONFIG,
+    KEYS,
 
     pub fn fromSlice(slice: []const u8) ?Command {
         if (std.ascii.eqlIgnoreCase(slice, "PING")) return .PING;
@@ -49,6 +50,7 @@ pub const Command = enum {
         if (std.ascii.eqlIgnoreCase(slice, "PSYNC")) return .PSYNC;
         if (std.ascii.eqlIgnoreCase(slice, "WAIT")) return .WAIT;
         if (std.ascii.eqlIgnoreCase(slice, "CONFIG")) return .CONFIG;
+        if (std.ascii.eqlIgnoreCase(slice, "KEYS")) return .KEYS;
         return null;
     }
 };

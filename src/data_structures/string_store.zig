@@ -83,4 +83,18 @@ pub const StringStore = struct {
 
         return true;
     }
+
+    pub fn keys(self: *StringStore, allocator: std.mem.Allocator) ![][]const u8 {
+        var list = std.ArrayList([]const u8).init(allocator);
+        errdefer list.deinit();
+
+        var it = self.data.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.isExpired()) {
+                continue;
+            }
+            try list.append(entry.key_ptr.*);
+        }
+        return list.toOwnedSlice();
+    }
 };

@@ -771,3 +771,15 @@ pub fn handleConfig(allocator: std.mem.Allocator, handler: *AppHandler, args: [6
 
     return Reply{ .Error = .{ .kind = ErrorKind.Syntax } };
 }
+
+pub fn handleKeys(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !Reply {
+    const pattern = args[1] orelse return Reply{ .Error = .{ .kind = ErrorKind.ArgNum } };
+    if (!std.mem.eql(u8, pattern, "*")) {
+        return Reply{ .Error = .{ .kind = ErrorKind.Syntax } };
+    }
+
+    const keys = try handler.string_store.keys(allocator);
+    defer allocator.free(keys);
+
+    return try stringArrayReply(allocator, keys);
+}
