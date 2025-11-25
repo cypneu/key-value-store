@@ -149,14 +149,21 @@ pub const AppHandler = struct {
             entry.value_ptr.read_buffer.deinit();
             self.clearTransactionQueue(entry.value_ptr);
             entry.value_ptr.transaction_queue.deinit();
+            self.cleanupStreamBlockingState(entry.value_ptr.blocking_stream_state);
         }
         var it = self.blocked_clients_by_key.iterator();
         while (it.next()) |entry| {
+            while (entry.value_ptr.popFirst()) |node| {
+                self.app_allocator.destroy(node);
+            }
             self.app_allocator.free(entry.key_ptr.*);
         }
         self.blocked_clients_by_key.deinit();
         var stream_it = self.blocked_stream_clients_by_key.iterator();
         while (stream_it.next()) |entry| {
+            while (entry.value_ptr.popFirst()) |node| {
+                self.app_allocator.destroy(node);
+            }
             self.app_allocator.free(entry.key_ptr.*);
         }
         self.blocked_stream_clients_by_key.deinit();
@@ -346,7 +353,30 @@ pub const AppHandler = struct {
         }
     }
 
-    pub fn ingest(self: *AppHandler, connection_id: u64, incoming: []const u8, request_allocator: std.mem.Allocator) !IngestResult {
+    fn processParsedCommand(
+        self: *AppHandler,
+        conn: *ClientConnection,
+        parts: [64]?[]const u8,
+        request_allocator: std.mem.Allocator,
+        notifications: *std.ArrayList(WriteOp),
+    ) anyerror!bool {
+        const single = try dispatcher.dispatchCommand(self, request_allocator, parts, conn);
+        switch (single) {
+            .Immediate => |value| {
+                if (value.bytes.len != 0) {
+                    try notifications.append(.{ .connection_id = conn.id, .bytes = value.bytes });
+                }
+                if (value.notify) |ns| try notifications.appendSlice(ns);
+                return false;
+            },
+            .Blocked => |blk| {
+                if (blk.notify) |ns| try notifications.appendSlice(ns);
+                return true;
+            },
+        }
+    }
+
+    pub fn ingest(self: *AppHandler, connection_id: u64, incoming: []const u8, request_allocator: std.mem.Allocator) anyerror!IngestResult {
         const conn = self.connection_by_id.getPtr(connection_id) orelse return .Close;
 
         try conn.read_buffer.appendSlice(incoming);
@@ -360,23 +390,16 @@ pub const AppHandler = struct {
                 .NeedMore => break,
                 .Error => return .Close,
                 .Done => |done| {
-                    const single = try dispatcher.dispatchCommand(self, request_allocator, done.parts, conn);
-                    switch (single) {
-                        .Immediate => |value| {
-                            if (value.bytes.len != 0) {
-                                try notifications.append(.{ .connection_id = connection_id, .bytes = value.bytes });
-                            }
-                            if (value.notify) |ns| try notifications.appendSlice(ns);
-                        },
-                        .Blocked => |blk| {
-                            if (blk.notify) |ns| try notifications.appendSlice(ns);
-                        },
-                    }
+                    const is_blocked = try self.processParsedCommand(conn, done.parts, request_allocator, &notifications);
 
                     self.updateReplicationOffset(connection_id, done.kind, done.consumed);
 
                     conn.read_start += done.consumed;
                     conn.parser.reset();
+
+                    if (is_blocked) {
+                        break;
+                    }
 
                     if (conn.read_start == conn.read_buffer.items.len) {
                         conn.read_buffer.clearRetainingCapacity();
@@ -613,6 +636,13 @@ pub const AppHandler = struct {
             const bytes = try buf.toOwnedSlice();
 
             try notifications.append(.{ .connection_id = id, .bytes = bytes });
+
+            const result = try self.ingest(id, &[_]u8{}, request_allocator);
+            switch (result) {
+                .Writes => |ops| try notifications.appendSlice(ops),
+                .Blocked => {},
+                .Close => {},
+            }
         }
 
         return .{ .ops = try notifications.toOwnedSlice(), .popped = actual_popped };
@@ -665,6 +695,13 @@ pub const AppHandler = struct {
                         conn.wait_state = null;
                         conn.deadline_us = null;
                     }
+                }
+
+                const result = try self.ingest(id, &[_]u8{}, request_allocator);
+                switch (result) {
+                    .Writes => |ops| try notifications.appendSlice(ops),
+                    .Blocked => {},
+                    .Close => {},
                 }
             }
         }
