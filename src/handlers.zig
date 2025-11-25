@@ -561,7 +561,7 @@ pub fn handleLlen(handler: *AppHandler, args: [64]?[]const u8) !Reply {
 pub fn handleLpop(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !Reply {
     const key = args[1] orelse return Reply{ .Error = .{ .kind = .ArgNum } };
     const count_slice = args[2] orelse "1";
-    const count = std.fmt.parseInt(u64, count_slice, 10) catch 1;
+    const count = std.fmt.parseInt(u64, count_slice, 10) catch return Reply{ .Error = .{ .kind = .NotInteger } };
 
     if (handler.string_store.contains(key)) return wrongTypeReply();
     if (handler.stream_store.contains(key)) return wrongTypeReply();
