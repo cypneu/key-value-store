@@ -51,7 +51,6 @@ pub const StreamParser = struct {
 
     bulk_remaining: usize = 0,
     simple_string_start: usize = 0,
-    allow_bulk_without_crlf: bool = false,
 
     const PartIndex = struct { start: usize, len: usize };
 
@@ -279,10 +278,6 @@ pub const StreamParser = struct {
         i = end;
         self.bulk_remaining = 0;
 
-        if (self.mode == .TopLevelBulk and self.allow_bulk_without_crlf) {
-            return self.finishMessage(buf, i);
-        }
-
         self.state = .BulkCR;
         idx_ptr.* = i;
         return null;
@@ -345,9 +340,7 @@ pub const StreamParser = struct {
     }
 
     pub fn reset(self: *StreamParser) void {
-        const allow = self.allow_bulk_without_crlf;
         self.* = .{};
-        self.allow_bulk_without_crlf = allow;
     }
 
     inline fn needMore(self: *StreamParser, idx: usize) ParseResult {

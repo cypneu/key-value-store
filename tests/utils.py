@@ -78,14 +78,16 @@ class Connection:
         length = int(line[1:])
         del self.reader.buf[:rest_idx]
 
-        while len(self.reader.buf) < length:
+        while len(self.reader.buf) < length + 2:
             chunk = self.sock.recv(4096)
             if not chunk:
                 raise ConnectionError("Connection closed")
             self.reader.feed(chunk)
 
         data = bytes(self.reader.buf[:length])
-        del self.reader.buf[:length]
+        if self.reader.buf[length : length + 2] != b"\r\n":
+            raise ValueError("Expected CRLF after RDB payload")
+        del self.reader.buf[: length + 2]
         return data
 
 

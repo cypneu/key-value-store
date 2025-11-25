@@ -738,6 +738,7 @@ pub fn handlePsync(allocator: std.mem.Allocator, handler: *AppHandler, connectio
     try buf.writer().print("${d}\r\n", .{rdb_bytes.len});
 
     try buf.appendSlice(rdb_bytes);
+    try buf.appendSlice("\r\n");
 
     if (!connection.is_replica) {
         connection.is_replica = true;

@@ -186,10 +186,6 @@ pub const AppHandler = struct {
         self.master_connection_id = connection_id;
         self.replication_offset = 0;
 
-        if (self.connection_by_id.getPtr(connection_id)) |conn| {
-            conn.parser.allow_bulk_without_crlf = true;
-        }
-
         var ops = std.ArrayList(WriteOp).init(allocator);
         errdefer ops.deinit();
 

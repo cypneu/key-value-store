@@ -138,7 +138,7 @@ def test_replica_responds_to_getack(server_factory):
             empty_rdb = bytes.fromhex(
                 "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bf220215a"
             )
-            conn.sendall(b"$" + str(len(empty_rdb)).encode() + b"\r\n" + empty_rdb)
+            conn.sendall(b"$" + str(len(empty_rdb)).encode() + b"\r\n" + empty_rdb + b"\r\n")
 
             conn.sendall(encode_command("REPLCONF", "GETACK", "*"))
             assert replica.read_resp() == ["REPLCONF", "ACK", "0"]
