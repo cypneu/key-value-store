@@ -62,48 +62,99 @@ pub fn main() !void {
 
 const Config = struct { port: u16, role: ServerRole, replica: ?ReplicaConfig, dir: []const u8, db_filename: []const u8 };
 
+const ConfigBuilder = struct {
+    allocator: std.mem.Allocator,
+    port: u16 = DEFAULT_PORT,
+    role: ServerRole = .master,
+    replica: ?ReplicaConfig = null,
+    dir: ?[]const u8 = null,
+    db_filename: ?[]const u8 = null,
+
+    pub fn init(allocator: std.mem.Allocator) ConfigBuilder {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *ConfigBuilder) void {
+        if (self.replica) |r| self.allocator.free(r.host);
+        if (self.dir) |d| self.allocator.free(d);
+        if (self.db_filename) |f| self.allocator.free(f);
+    }
+
+    pub fn setPort(self: *ConfigBuilder, val: []const u8) !void {
+        self.port = try std.fmt.parseInt(u16, val, 10);
+    }
+
+    pub fn setReplica(self: *ConfigBuilder, val: []const u8) !void {
+        var tokens = std.mem.tokenizeScalar(u8, val, ' ');
+        const host = tokens.next() orelse return error.InvalidReplicaOfValue;
+        const port_str = tokens.next() orelse return error.InvalidReplicaOfValue;
+        if (tokens.next() != null) return error.InvalidReplicaOfValue;
+
+        const port = try std.fmt.parseInt(u16, port_str, 10);
+        const host_copy = try self.allocator.dupe(u8, host);
+
+        if (self.replica) |r| self.allocator.free(r.host);
+        self.role = .replica;
+        self.replica = .{ .host = host_copy, .port = port };
+    }
+
+    pub fn setDir(self: *ConfigBuilder, val: []const u8) !void {
+        if (self.dir) |d| self.allocator.free(d);
+        self.dir = try self.allocator.dupe(u8, val);
+    }
+
+    pub fn setDbFilename(self: *ConfigBuilder, val: []const u8) !void {
+        if (self.db_filename) |f| self.allocator.free(f);
+        self.db_filename = try self.allocator.dupe(u8, val);
+    }
+
+    pub fn build(self: *ConfigBuilder) !Config {
+        const r_replica = self.replica;
+        self.replica = null;
+        errdefer if (r_replica) |r| self.allocator.free(r.host);
+
+        const r_dir = if (self.dir) |d| d else try self.allocator.dupe(u8, ".");
+        self.dir = null;
+        errdefer self.allocator.free(r_dir);
+
+        const r_db_filename = if (self.db_filename) |f| f else try self.allocator.dupe(u8, "dump.rdb");
+        self.db_filename = null;
+        errdefer self.allocator.free(r_db_filename);
+
+        return Config{
+            .port = self.port,
+            .role = self.role,
+            .replica = r_replica,
+            .dir = r_dir,
+            .db_filename = r_db_filename,
+        };
+    }
+};
+
 fn parseConfig(allocator: std.mem.Allocator) !Config {
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
 
     _ = args.next();
 
-    var port: u16 = DEFAULT_PORT;
-    var role: ServerRole = .master;
-    var replica: ?ReplicaConfig = null;
-    var dir: ?[]const u8 = null;
-    var db_filename: ?[]const u8 = null;
+    var builder = ConfigBuilder.init(allocator);
+    defer builder.deinit();
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--port")) {
             const value = args.next() orelse return error.MissingPortValue;
-            port = try std.fmt.parseInt(u16, value, 10);
+            try builder.setPort(value);
         } else if (std.mem.eql(u8, arg, "--replicaof")) {
             const value = args.next() orelse return error.MissingReplicaOfValue;
-            var tokens = std.mem.tokenizeScalar(u8, value, ' ');
-            const host = tokens.next() orelse return error.InvalidReplicaOfValue;
-            const port_str = tokens.next() orelse return error.InvalidReplicaOfValue;
-            if (tokens.next() != null) return error.InvalidReplicaOfValue;
-
-            const replica_port = try std.fmt.parseInt(u16, port_str, 10);
-            const host_copy = try allocator.dupe(u8, host);
-
-            role = .replica;
-            replica = .{ .host = host_copy, .port = replica_port };
+            try builder.setReplica(value);
         } else if (std.mem.eql(u8, arg, "--dir")) {
             const value = args.next() orelse return error.MissingDirValue;
-            dir = try allocator.dupe(u8, value);
+            try builder.setDir(value);
         } else if (std.mem.eql(u8, arg, "--dbfilename")) {
             const value = args.next() orelse return error.MissingDbFilenameValue;
-            db_filename = try allocator.dupe(u8, value);
+            try builder.setDbFilename(value);
         }
     }
 
-    return .{
-        .port = port,
-        .role = role,
-        .replica = replica,
-        .dir = dir orelse try allocator.dupe(u8, "."),
-        .db_filename = db_filename orelse try allocator.dupe(u8, "dump.rdb"),
-    };
+    return builder.build();
 }
