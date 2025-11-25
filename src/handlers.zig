@@ -779,8 +779,32 @@ pub fn handleKeys(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]
         return Reply{ .Error = .{ .kind = ErrorKind.Syntax } };
     }
 
-    const keys = try handler.string_store.keys(allocator);
-    defer allocator.free(keys);
+    const string_keys = try handler.string_store.keys(allocator);
+    defer allocator.free(string_keys);
 
-    return try stringArrayReply(allocator, keys);
+    const list_keys = try handler.list_store.keys(allocator);
+    defer allocator.free(list_keys);
+
+    const stream_keys = try handler.stream_store.keys(allocator);
+    defer allocator.free(stream_keys);
+
+    const total = string_keys.len + list_keys.len + stream_keys.len;
+    var merged = try allocator.alloc([]const u8, total);
+    defer allocator.free(merged);
+
+    var idx: usize = 0;
+    for (string_keys) |k| {
+        merged[idx] = k;
+        idx += 1;
+    }
+    for (list_keys) |k| {
+        merged[idx] = k;
+        idx += 1;
+    }
+    for (stream_keys) |k| {
+        merged[idx] = k;
+        idx += 1;
+    }
+
+    return try stringArrayReply(allocator, merged);
 }

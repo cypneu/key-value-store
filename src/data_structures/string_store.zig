@@ -88,12 +88,14 @@ pub const StringStore = struct {
         var list = std.ArrayList([]const u8).init(allocator);
         errdefer list.deinit();
 
+        var expired = std.ArrayList([]const u8).init(self.allocator);
+        defer expired.deinit();
+
         var it = self.data.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.isExpired()) {
-                continue;
+            if (!entry.value_ptr.isExpired()) {
+                try list.append(entry.key_ptr.*);
             }
-            try list.append(entry.key_ptr.*);
         }
         return list.toOwnedSlice();
     }

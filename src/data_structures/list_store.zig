@@ -102,6 +102,18 @@ pub const ListStore = struct {
     pub fn contains(self: *ListStore, key: []const u8) bool {
         return self.data.get(key) != null;
     }
+
+    pub fn keys(self: *ListStore, allocator: std.mem.Allocator) ![][]const u8 {
+        var list = std.ArrayList([]const u8).init(allocator);
+        errdefer list.deinit();
+
+        var it = self.data.iterator();
+        while (it.next()) |entry| {
+            try list.append(entry.key_ptr.*);
+        }
+
+        return list.toOwnedSlice();
+    }
 };
 
 pub fn RangeView(comptime T: type) type {
