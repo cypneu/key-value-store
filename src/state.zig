@@ -314,15 +314,16 @@ pub const AppHandler = struct {
         connection: *ClientConnection,
         required: u64,
         timeout_ms: u64,
+        target_offset: u64,
     ) !void {
         connection.wait_state = .{
             .required = required,
-            .target_offset = self.replication_offset,
+            .target_offset = target_offset,
         };
         try self.waiters.append(.{
             .connection_id = connection.id,
             .required = required,
-            .target_offset = self.replication_offset,
+            .target_offset = target_offset,
         });
 
         if (timeout_ms > 0) {
@@ -686,9 +687,7 @@ pub const AppHandler = struct {
                     if (self.findWaiterIndex(id)) |idx| {
                         const wait = self.waiters.items[idx];
                         const acked = self.countReplicasAtOrBeyond(wait.target_offset);
-                        const total = self.replicas.items.len;
-                        const final = if (acked < total) total else acked;
-                        const bytes = try renderIntegerReply(request_allocator, final);
+                        const bytes = try renderIntegerReply(request_allocator, acked);
                         try notifications.append(.{ .connection_id = id, .bytes = bytes });
                         self.removeWaiterAt(idx);
                     } else {

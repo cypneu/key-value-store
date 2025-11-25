@@ -419,7 +419,7 @@ pub fn handleWait(
     const prop = try replication.propagateCommand(allocator, replica_ids, args_buf, 3);
     handler.recordPropagation(prop.bytes_len);
 
-    try handler.registerWait(client_connection, required, @intCast(timeout_ms));
+    try handler.registerWait(client_connection, required, @intCast(timeout_ms), target_offset);
 
     return .{ .Blocked = .{ .notify = prop.ops } };
 }

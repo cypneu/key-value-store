@@ -2,7 +2,7 @@ import time
 
 import pytest
 
-from .utils import encode_command, read_reply
+from .utils import encode_command, read_reply, Connection
 
 
 def test_wait_returns_zero_without_replicas(master):
@@ -45,3 +45,41 @@ def test_wait_after_write(cluster):
         client.sendall(encode_command("WAIT", "2", "500"))
         reply = read_reply(client)
         assert reply >= 2
+
+
+def test_wait_timeout_reports_ack_count(server_factory):
+    master = server_factory()
+    replicas = [_connect_fake_replica(master) for _ in range(2)]
+
+    try:
+        with master.client() as client:
+            client.sendall(encode_command("SET", "key", "value"))
+            assert read_reply(client) == "OK"
+
+            client.sendall(encode_command("WAIT", "3", "10"))
+            reply = read_reply(client)
+            assert reply == 0
+    finally:
+        for replica in replicas:
+            replica.sock.close()
+
+
+def _connect_fake_replica(master):
+    sock = master.client()
+    conn = Connection(sock)
+
+    sock.sendall(encode_command("PING"))
+    assert conn.read_resp() == "PONG"
+
+    sock.sendall(encode_command("REPLCONF", "listening-port", "0"))
+    assert conn.read_resp() == "OK"
+
+    sock.sendall(encode_command("REPLCONF", "capa", "psync2"))
+    assert conn.read_resp() == "OK"
+
+    sock.sendall(encode_command("PSYNC", "?", "-1"))
+    resp = conn.read_resp()
+    assert isinstance(resp, str) and resp.startswith("FULLRESYNC")
+
+    conn.read_rdb()
+    return conn
