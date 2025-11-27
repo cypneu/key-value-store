@@ -251,10 +251,25 @@ pub fn Server(comptime H: type) type {
         }
 
         fn writeOps(self: *Self, ops: []WriteOp) void {
+            var current_fd: ?posix.fd_t = null;
+
             for (ops) |w| {
                 if (self.id_to_fd.get(w.connection_id)) |fd| {
-                    self.enqueueWrite(fd, w.bytes);
+                    if (current_fd) |curr| {
+                        if (curr != fd) {
+                            _ = self.flushPendingWritesForEvent(curr);
+                            current_fd = fd;
+                        }
+                    } else {
+                        current_fd = fd;
+                    }
+
+                    self.appendWriteBuffer(fd, w.bytes);
                 }
+            }
+
+            if (current_fd) |fd| {
+                _ = self.flushPendingWritesForEvent(fd);
             }
         }
 
@@ -295,19 +310,13 @@ pub fn Server(comptime H: type) type {
             log.info("Closed connection: fd={d}", .{client_fd});
         }
 
-        fn enqueueWrite(self: *Self, fd: posix.fd_t, bytes: []const u8) void {
+        fn appendWriteBuffer(self: *Self, fd: posix.fd_t, bytes: []const u8) void {
             const state_ptr = self.pending_writes.getPtr(fd) orelse return;
 
             state_ptr.buffer.appendSlice(bytes) catch {
                 self.closeConnection(fd);
                 return;
             };
-
-            switch (self.flushPendingWrites(fd, state_ptr)) {
-                .Idle => {},
-                .Pending => {},
-                .Closed => self.closeConnection(fd),
-            }
         }
 
         fn flushPendingWritesForEvent(self: *Self, fd: posix.fd_t) bool {
