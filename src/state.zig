@@ -171,13 +171,6 @@ pub const AppHandler = struct {
         self.replica_acks.deinit();
         self.waiters.deinit();
 
-        if (self.master) |master| {
-            self.app_allocator.free(master.host);
-        }
-
-        self.app_allocator.free(self.dir);
-        self.app_allocator.free(self.db_filename);
-
         self.connection_by_id.deinit();
         self.timeouts.deinit();
     }

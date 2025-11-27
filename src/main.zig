@@ -27,6 +27,7 @@ pub fn main() !void {
         log.err("Failed to parse CLI args: {}", .{err});
         return err;
     };
+    defer config.deinit(allocator);
 
     log.info("Initializing server on port {d}...", .{config.port});
 
@@ -60,7 +61,19 @@ pub fn main() !void {
     try server_instance.run();
 }
 
-const Config = struct { port: u16, role: ServerRole, replica: ?ReplicaConfig, dir: []const u8, db_filename: []const u8 };
+const Config = struct {
+    port: u16,
+    role: ServerRole,
+    replica: ?ReplicaConfig,
+    dir: []const u8,
+    db_filename: []const u8,
+
+    pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
+        allocator.free(self.dir);
+        allocator.free(self.db_filename);
+        if (self.replica) |r| allocator.free(r.host);
+    }
+};
 
 const ConfigBuilder = struct {
     allocator: std.mem.Allocator,
