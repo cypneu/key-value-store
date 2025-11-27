@@ -111,28 +111,41 @@ pub fn Server(comptime H: type) type {
             const addrs = try net.getAddressList(self.allocator, host, port);
             defer addrs.deinit();
 
+            var connect_err: anyerror = error.ConnectionRefused;
+
             for (addrs.addrs) |address| {
-                const socket_type = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
-                const protocol = posix.IPPROTO.TCP;
-                const fd = try posix.socket(address.any.family, socket_type, protocol);
-                errdefer posix.close(fd);
-
-                _ = posix.connect(fd, &address.any, address.getOsSockLen()) catch |err| {
-                    if (err != error.WouldBlock) return err;
+                self.attemptMasterConnection(address, listening_port) catch |err| {
+                    connect_err = err;
+                    continue;
                 };
-
-                const conn_id = try self.handler.createConnection();
-                try self.registerConnection(fd, conn_id);
-
-                self.connecting_master_id = conn_id;
-                self.master_listening_port = listening_port;
-
-                if (self.pending_writes.getPtr(fd)) |state| {
-                    try self.setWriteInterest(fd, state, true);
-                }
+                return;
             }
+
+            return connect_err;
         }
 
+        fn attemptMasterConnection(self: *Self, address: net.Address, listening_port: u16) !void {
+            const socket_type = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
+            const protocol = posix.IPPROTO.TCP;
+            const fd = try posix.socket(address.any.family, socket_type, protocol);
+            errdefer posix.close(fd);
+
+            _ = posix.connect(fd, &address.any, address.getOsSockLen()) catch |err| {
+                if (err != error.WouldBlock) return err;
+            };
+
+            const conn_id = try self.handler.createConnection();
+            errdefer self.handler.removeConnection(conn_id);
+
+            try self.registerConnection(fd, conn_id);
+
+            self.connecting_master_id = conn_id;
+            self.master_listening_port = listening_port;
+
+            if (self.pending_writes.getPtr(fd)) |state| {
+                try self.setWriteInterest(fd, state, true);
+            }
+        }
         pub fn run(self: *Self) !void {
             var ready_list: [MAX_EPOLL_EVENTS]linux.epoll_event = undefined;
 
