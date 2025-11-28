@@ -20,7 +20,13 @@ const log = std.log.scoped(.app);
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer {
+        const deinit_status = gpa.deinit();
+        if (deinit_status == .leak) {
+            log.err("Memory leak detected!", .{});
+            std.process.exit(1);
+        }
+    }
     const allocator = gpa.allocator();
 
     const config = parseConfig(allocator) catch |err| {

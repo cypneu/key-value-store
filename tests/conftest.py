@@ -3,6 +3,8 @@ import shutil
 import socket
 import subprocess
 import time
+import tempfile
+import os
 from pathlib import Path
 from typing import NamedTuple
 
@@ -14,10 +16,11 @@ _KEY_COUNTER = itertools.count()
 
 
 class RedisServer:
-    def __init__(self, proc: subprocess.Popen, port: int):
+    def __init__(self, proc: subprocess.Popen, port: int, stderr_file):
         self.proc = proc
         self.port = port
         self.host = "127.0.0.1"
+        self.stderr_file = stderr_file
 
     def client(self, timeout: float = 2.0) -> socket.socket:
         s = socket.create_connection((self.host, self.port), timeout=timeout)
@@ -30,6 +33,19 @@ class RedisServer:
                 self.proc.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+                self.proc.wait()
+
+        # Check for memory leaks
+        if self.proc.returncode != 0:
+            self.stderr_file.seek(0)
+            stderr_output = self.stderr_file.read().decode('utf-8', errors='replace')
+            
+            if "Memory leak detected" in stderr_output:
+                raise RuntimeError(f"Memory leak detected in server on port {self.port}!\nLogs:\n{stderr_output}")
+
+    def cleanup(self):
+        self.close()
+        self.stderr_file.close()
 
 
 class RedisCluster(NamedTuple):
@@ -53,14 +69,21 @@ def server_factory():
         port = _find_free_port()
         cmd = [str(BIN), "--port", str(port)] + (args or [])
 
-        proc = subprocess.Popen(cmd, cwd=str(ROOT))
-        server = RedisServer(proc, port)
+        # Use a temporary file for stderr to avoid buffer filling issues
+        stderr_file = tempfile.TemporaryFile()
+        
+        proc = subprocess.Popen(
+            cmd, 
+            cwd=str(ROOT),
+            stderr=stderr_file
+        )
+        server = RedisServer(proc, port, stderr_file)
         servers.append(server)
 
         try:
             _wait_for_port(server.host, server.port, time.time() + 5.0)
         except Exception:
-            server.close()
+            server.cleanup()
             raise
 
         return server
@@ -68,7 +91,7 @@ def server_factory():
     yield _spawn
 
     for server in servers:
-        server.close()
+        server.cleanup()
 
 
 @pytest.fixture
@@ -96,7 +119,7 @@ def cluster(request, server_factory) -> RedisCluster:
 @pytest.fixture
 def make_key():
     def _factory(prefix: str) -> str:
-        return f"t_{prefix}_{next(_KEY_COUNTER)}"
+        return f"t_{{prefix}}_{next(_KEY_COUNTER)}"
 
     return _factory
 
@@ -105,7 +128,6 @@ def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
-
 
 def _wait_for_port(host: str, port: int, deadline: float) -> None:
     while time.time() < deadline:
