@@ -241,9 +241,15 @@ pub fn Server(comptime H: type) type {
                     return self.closeConnection(client_fd);
                 };
 
-                const result = try self.handler.ingest(conn_id, buffer[0..bytes_read], request_allocator);
-                switch (result) {
-                    .Writes => |writes| self.writeOps(writes),
+                var notifications = std.ArrayList(WriteOp).init(request_allocator);
+
+                const status = try self.handler.ingest(conn_id, buffer[0..bytes_read], request_allocator, &notifications);
+
+                if (notifications.items.len > 0) {
+                    self.writeOps(notifications.items);
+                }
+
+                switch (status) {
                     .Blocked => {},
                     .Close => return self.closeConnection(client_fd),
                 }

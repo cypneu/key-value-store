@@ -366,12 +366,15 @@ pub const AppHandler = struct {
         }
     }
 
-    pub fn ingest(self: *AppHandler, connection_id: u64, incoming: []const u8, request_allocator: std.mem.Allocator) anyerror!IngestResult {
+    pub const IngestStatus = enum {
+        Blocked,
+        Close,
+    };
+
+    pub fn ingest(self: *AppHandler, connection_id: u64, incoming: []const u8, request_allocator: std.mem.Allocator, notifications: *std.ArrayList(WriteOp)) anyerror!IngestStatus {
         const conn = self.connection_by_id.getPtr(connection_id) orelse return .Close;
 
         try conn.read_buffer.appendSlice(incoming);
-
-        var notifications = std.ArrayList(WriteOp).init(request_allocator);
 
         while (true) {
             const available = conn.read_buffer.items[conn.read_start..];
@@ -380,7 +383,7 @@ pub const AppHandler = struct {
                 .NeedMore => break,
                 .Error => return .Close,
                 .Done => |done| {
-                    const is_blocked = try self.processParsedCommand(conn, done.parts, request_allocator, &notifications);
+                    const is_blocked = try self.processParsedCommand(conn, done.parts, request_allocator, notifications);
 
                     self.updateReplicationOffset(connection_id, done.kind, done.consumed);
 
@@ -400,9 +403,6 @@ pub const AppHandler = struct {
             }
         }
 
-        if (notifications.items.len != 0) {
-            return .{ .Writes = try notifications.toOwnedSlice() };
-        }
         return .Blocked;
     }
 
@@ -627,12 +627,7 @@ pub const AppHandler = struct {
 
             try notifications.append(.{ .connection_id = id, .bytes = bytes });
 
-            const result = try self.ingest(id, &[_]u8{}, request_allocator);
-            switch (result) {
-                .Writes => |ops| try notifications.appendSlice(ops),
-                .Blocked => {},
-                .Close => {},
-            }
+            _ = try self.ingest(id, &[_]u8{}, request_allocator, &notifications);
         }
 
         return .{ .ops = try notifications.toOwnedSlice(), .popped = actual_popped };
@@ -685,12 +680,7 @@ pub const AppHandler = struct {
                     }
                 }
 
-                const result = try self.ingest(id, &[_]u8{}, request_allocator);
-                switch (result) {
-                    .Writes => |ops| try notifications.appendSlice(ops),
-                    .Blocked => {},
-                    .Close => {},
-                }
+                _ = try self.ingest(id, &[_]u8{}, request_allocator, &notifications);
             }
         }
 
