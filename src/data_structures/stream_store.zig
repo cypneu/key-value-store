@@ -552,4 +552,13 @@ pub const StreamStore = struct {
 
         return list.toOwnedSlice();
     }
+
+    pub fn clear(self: *StreamStore) void {
+        var it = self.data.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.data.clearRetainingCapacity();
+    }
 };

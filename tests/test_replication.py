@@ -1,7 +1,7 @@
 import socket
 import threading
 import time
-from .utils import encode_command, read_reply, Connection
+from .utils import encode_command, read_reply, Connection, exec_command
 
 
 def test_replica_handshake_sends_commands(server_factory):
@@ -205,15 +205,55 @@ def test_replica_processes_blocking_effects(cluster):
         assert read_reply(client) == 0
 
 
-def _wait_for_key(client, key, expected_val, timeout=2.0):
-    start = time.time()
-    while time.time() - start < timeout:
-        client.sendall(encode_command("GET", key))
-        val = read_reply(client)
-        if val == expected_val:
-            return val
-        time.sleep(0.05)
-    return None
+def test_psync_fullresync_transfers_data(server_factory):
+    master = server_factory()
+
+    with master.client() as client:
+        assert exec_command(client, "SET", "snap_string", "value") == "OK"
+        assert exec_command(client, "RPUSH", "snap_list", "a", "b") == 2
+        assert (
+            exec_command(client, "XADD", "snap_stream", "*", "foo", "bar") is not None
+        )
+
+    replica = server_factory(args=["--replicaof", f"{master.host} {master.port}"])
+
+    with replica.client() as client:
+        val = _wait_for_key(client, "snap_string", "value", timeout=3.0)
+        assert val == "value"
+
+        client.sendall(encode_command("LRANGE", "snap_list", "0", "-1"))
+        assert read_reply(client) == ["a", "b"]
+
+        client.sendall(encode_command("XRANGE", "snap_stream", "-", "+"))
+        stream_reply = read_reply(client)
+        assert isinstance(stream_reply, list)
+        assert len(stream_reply) == 1
+        assert stream_reply[0][1] == ["foo", "bar"]
+
+
+def test_psync_preserves_expiry(server_factory):
+    master = server_factory()
+
+    ttl_ms = 3000
+    with master.client() as client:
+        assert (
+            exec_command(client, "SET", "expiring_key", "ephemeral", "PX", str(ttl_ms))
+            == "OK"
+        )
+
+    replica = server_factory(args=["--replicaof", f"{master.host} {master.port}"])
+
+    with replica.client() as client:
+        val = _wait_for_key(client, "expiring_key", "ephemeral", timeout=3.0)
+        assert val == "ephemeral"
+
+        time.sleep(1.0)
+        client.sendall(encode_command("GET", "expiring_key"))
+        assert read_reply(client) == "ephemeral"
+
+        time.sleep(2.5)
+        client.sendall(encode_command("GET", "expiring_key"))
+        assert read_reply(client) is None
 
 
 def _blocking_client(port, key):
@@ -284,3 +324,147 @@ def test_replica_single_connection(server_factory):
     server_sock.close()
 
     assert len(connections) == 1, f"Expected 1 connection, got {len(connections)}"
+
+
+def test_concurrent_writes_during_snapshot(server_factory):
+    master = server_factory()
+
+    with master.client() as client:
+        for i in range(50):
+            exec_command(client, "SET", f"pre_{i}", f"val_{i}")
+
+    stop_writing = threading.Event()
+    write_errors = []
+
+    def writer_thread():
+        try:
+            with master.client() as client:
+                i = 0
+                while not stop_writing.is_set():
+                    exec_command(client, "SET", f"conc_{i}", f"val_{i}")
+                    i += 1
+                    if i % 10 == 0:
+                        time.sleep(0.001)
+        except Exception as e:
+            write_errors.append(e)
+
+    t = threading.Thread(target=writer_thread)
+    t.start()
+
+    time.sleep(0.1)
+    replica = server_factory(args=["--replicaof", f"{master.host} {master.port}"])
+
+    time.sleep(2.0)
+    stop_writing.set()
+    t.join()
+
+    assert not write_errors, f"Writer thread failed: {write_errors}"
+
+    with replica.client() as client:
+        val = _wait_for_key(client, "pre_49", "val_49")
+        assert val == "val_49", "Replica missed data from RDB snapshot"
+
+        val = _wait_for_key(client, "conc_0", "val_0")
+        assert val == "val_0", (
+            "Replica missed concurrent writes buffered during snapshot"
+        )
+
+
+def test_large_dataset_transfer(server_factory):
+    master = server_factory()
+
+    payload = "x" * 100
+    with master.client() as client:
+        for i in range(1000):
+            exec_command(client, "SET", f"large_{i}", payload)
+
+    replica = server_factory(args=["--replicaof", f"{master.host} {master.port}"])
+
+    with replica.client() as client:
+        val = _wait_for_key(client, "large_999", payload, timeout=5.0)
+        assert val == payload
+
+
+def test_replica_reconnection_lifecycle(server_factory):
+    master = server_factory()
+
+    replica1 = server_factory(args=["--replicaof", f"{master.host} {master.port}"])
+    with replica1.client() as c:
+        assert _wait_for_key(c, "nonexistent", None) is None
+
+    replica1.close()
+
+    with master.client() as client:
+        exec_command(client, "SET", "k1", "v1")
+
+    replica2 = server_factory(args=["--replicaof", f"{master.host} {master.port}"])
+
+    with replica2.client() as c:
+        val = _wait_for_key(c, "k1", "v1")
+        assert val == "v1"
+
+
+def test_replica_handles_fragmented_master_stream(server_factory):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as master_sock:
+        master_sock.bind(("127.0.0.1", 0))
+        master_sock.listen(1)
+        master_port = master_sock.getsockname()[1]
+
+        replica_server = server_factory(
+            args=["--replicaof", f"127.0.0.1 {master_port}"]
+        )
+
+        conn, _ = master_sock.accept()
+        with conn:
+            reader = Connection(conn)
+
+            assert reader.read_resp() == ["PING"]
+            conn.sendall(b"+PONG\r\n")
+
+            assert reader.read_resp()[0] == "REPLCONF"
+            conn.sendall(b"+OK\r\n")
+
+            assert reader.read_resp()[0] == "REPLCONF"
+            conn.sendall(b"+OK\r\n")
+
+            assert reader.read_resp()[0] == "PSYNC"
+
+            msg = b"+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0\r\n"
+            for i in range(0, len(msg), 3):
+                conn.sendall(msg[i : i + 3])
+                time.sleep(0.01)
+
+            empty_rdb = bytes.fromhex(
+                "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bf220215a"
+            )
+
+            header = b"$" + str(len(empty_rdb)).encode() + b"\r\n"
+            conn.sendall(header[:2])
+            time.sleep(0.01)
+            conn.sendall(header[2:])
+
+            payload_with_footer = empty_rdb + b"\r\n"
+            chunk_size = 10
+            for i in range(0, len(payload_with_footer), chunk_size):
+                conn.sendall(payload_with_footer[i : i + chunk_size])
+                time.sleep(0.005)
+
+            cmd = encode_command("SET", "foo", "bar")
+            conn.sendall(cmd[:5])
+            time.sleep(0.01)
+            conn.sendall(cmd[5:])
+
+            with replica_server.client() as c:
+                val = _wait_for_key(c, "foo", "bar")
+                assert val == "bar", "Replica failed to parse fragmented command stream"
+
+
+def _wait_for_key(client, key, expected_val, timeout=2.0):
+    start = time.time()
+    while time.time() - start < timeout:
+        client.sendall(encode_command("GET", key))
+        val = read_reply(client)
+        if val == expected_val:
+            return val
+        time.sleep(0.05)
+    return None

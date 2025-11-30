@@ -157,11 +157,35 @@ fn collectNotifications(
     if (replication.isReplicationCommand(command) and !replyIsError(result.reply)) {
         const part_count = countCommandParts(command_parts);
         const prop = try replication.propagateCommand(allocator, handler.replicas.items, command_parts, part_count);
+        defer allocator.free(prop.ops);
+
         handler.recordPropagation(prop.bytes_len);
-        try appendNotify(&notifications, prop.ops);
+        for (prop.ops) |op| {
+            if (handler.connection_by_id.getPtr(op.connection_id)) |conn| {
+                if (conn.is_loading_snapshot) {
+                    try handler.bufferReplicaWrite(op.connection_id, op.bytes);
+                    allocator.free(op.bytes);
+                    continue;
+                }
+            }
+            try notifications.append(op);
+        }
     }
 
-    try appendNotify(&notifications, result.notify);
+    // Process result.notify (e.g. LPOP from RPUSH)
+    if (result.notify.len > 0) {
+        defer allocator.free(result.notify);
+        for (result.notify) |op| {
+            if (handler.connection_by_id.getPtr(op.connection_id)) |conn| {
+                if (conn.is_loading_snapshot) {
+                    try handler.bufferReplicaWrite(op.connection_id, op.bytes);
+                    allocator.free(op.bytes);
+                    continue;
+                }
+            }
+            try notifications.append(op);
+        }
+    }
 
     if (notifications.items.len == 0) {
         return null;

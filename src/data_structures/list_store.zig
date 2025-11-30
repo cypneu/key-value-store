@@ -114,6 +114,15 @@ pub const ListStore = struct {
 
         return list.toOwnedSlice();
     }
+
+    pub fn clear(self: *ListStore) void {
+        var it = self.data.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit();
+        }
+        self.data.clearRetainingCapacity();
+    }
 };
 
 pub fn RangeView(comptime T: type) type {

@@ -96,4 +96,13 @@ pub const StringStore = struct {
         }
         return list.toOwnedSlice();
     }
+
+    pub fn clear(self: *StringStore) void {
+        var it = self.data.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.data);
+        }
+        self.data.clearRetainingCapacity();
+    }
 };

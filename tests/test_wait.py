@@ -42,7 +42,7 @@ def test_wait_after_write(cluster):
         client.sendall(encode_command("SET", "foo", "bar"))
         assert read_reply(client) == "OK"
 
-        client.sendall(encode_command("WAIT", "2", "500"))
+        client.sendall(encode_command("WAIT", "2", "3000"))
         reply = read_reply(client)
         assert reply >= 2
 

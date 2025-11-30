@@ -4,6 +4,7 @@ const dispatcher = @import("dispatcher.zig");
 const format = @import("resp/format.zig");
 const Reply = @import("reply.zig").Reply;
 const Command = @import("command.zig").Command;
+const rdb = @import("rdb.zig");
 const Order = std.math.Order;
 const StreamParser = @import("resp/stream_parser.zig").StreamParser;
 const StreamReadRequest = @import("handlers.zig").StreamReadRequest;
@@ -36,6 +37,8 @@ pub const ClientConnection = struct {
     in_transaction: bool,
     transaction_queue: std.ArrayList(TransactionCommand),
     is_replica: bool,
+    is_loading_snapshot: bool = false,
+    pending_replication: std.ArrayList([]const u8),
 
     read_buffer: std.ArrayList(u8),
     read_start: usize,
@@ -65,6 +68,13 @@ const WaitRegistration = struct {
     target_offset: u64,
 };
 
+const SnapshotRegistration = struct {
+    connection_id: u64,
+    read_fd: std.posix.fd_t,
+    expected_len: usize,
+    child_pid: std.posix.pid_t,
+};
+
 pub const TransactionCommand = struct {
     command: Command,
     parts: [][]const u8,
@@ -89,6 +99,7 @@ pub const AppHandler = struct {
     replicas: std.ArrayList(u64),
     replica_acks: std.hash_map.AutoHashMap(u64, u64),
     waiters: std.ArrayList(WaitRegistration),
+    pending_snapshots: std.ArrayList(SnapshotRegistration),
 
     next_connection_id: u64,
 
@@ -120,6 +131,7 @@ pub const AppHandler = struct {
         const blocked_stream_clients_by_key = std.hash_map.StringHashMap(StreamWaitList).init(allocator);
         const replicas = std.ArrayList(u64).init(allocator);
         const timeouts = TimeoutQueue.init(allocator, {});
+        const pending_snapshots = std.ArrayList(SnapshotRegistration).init(allocator);
 
         return .{
             .app_allocator = allocator,
@@ -138,6 +150,7 @@ pub const AppHandler = struct {
             .replicas = replicas,
             .replica_acks = std.hash_map.AutoHashMap(u64, u64).init(allocator),
             .waiters = std.ArrayList(WaitRegistration).init(allocator),
+            .pending_snapshots = pending_snapshots,
             .next_connection_id = 0,
             .timeouts = timeouts,
         };
@@ -150,6 +163,7 @@ pub const AppHandler = struct {
             self.clearTransactionQueue(entry.value_ptr);
             entry.value_ptr.transaction_queue.deinit();
             self.cleanupStreamBlockingState(entry.value_ptr.blocking_stream_state);
+            self.clearPendingReplication(entry.value_ptr);
         }
         var it = self.blocked_clients_by_key.iterator();
         while (it.next()) |entry| {
@@ -170,6 +184,7 @@ pub const AppHandler = struct {
         self.replicas.deinit();
         self.replica_acks.deinit();
         self.waiters.deinit();
+        self.pending_snapshots.deinit();
 
         self.connection_by_id.deinit();
         self.timeouts.deinit();
@@ -195,7 +210,7 @@ pub const AppHandler = struct {
         return ops.toOwnedSlice();
     }
 
-    fn formatCommand(self: *AppHandler, allocator: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+    pub fn formatCommand(self: *AppHandler, allocator: std.mem.Allocator, parts: []const []const u8) ![]u8 {
         _ = self;
         var items = try allocator.alloc(Reply, parts.len);
         defer allocator.free(items);
@@ -273,8 +288,7 @@ pub const AppHandler = struct {
             idx -= 1;
             const wait = self.waiters.items[idx];
             const acked = self.countReplicasAtOrBeyond(wait.target_offset);
-            const total = self.replicas.items.len;
-            if (@as(u64, @intCast(acked)) >= wait.required or acked == total) {
+            if (@as(u64, @intCast(acked)) >= wait.required) {
                 const bytes = try renderIntegerReply(allocator, acked);
                 try notifications.append(.{ .connection_id = wait.connection_id, .bytes = bytes });
                 self.removeWaiterAt(idx);
@@ -383,6 +397,40 @@ pub const AppHandler = struct {
                 .NeedMore => break,
                 .Error => return .Close,
                 .Done => |done| {
+                    if (done.kind == .SimpleString and self.role == .replica and self.isMasterConnection(connection_id)) {
+                        const message = done.parts[0] orelse return .Close;
+                        if (std.mem.startsWith(u8, message, "FULLRESYNC")) {
+                            var it = std.mem.tokenizeScalar(u8, message, ' ');
+                            _ = it.next(); // FULLRESYNC
+                            _ = it.next(); // replid
+                            if (it.next()) |offset_slice| {
+                                self.replication_offset = std.fmt.parseInt(u64, offset_slice, 10) catch 0;
+                            }
+                        }
+
+                        conn.read_start += done.consumed;
+                        conn.parser.reset();
+                        if (conn.read_start == conn.read_buffer.items.len) {
+                            conn.read_buffer.clearRetainingCapacity();
+                            conn.read_start = 0;
+                        }
+                        continue;
+                    }
+
+                    if (done.kind == .TopLevelBulk and self.role == .replica and self.isMasterConnection(connection_id)) {
+                        const payload = done.parts[0] orelse return .Close;
+                        try self.applyRdbSnapshot(request_allocator, payload);
+
+                        conn.read_start += done.consumed;
+                        conn.parser.reset();
+
+                        if (conn.read_start == conn.read_buffer.items.len) {
+                            conn.read_buffer.clearRetainingCapacity();
+                            conn.read_start = 0;
+                        }
+                        continue;
+                    }
+
                     const is_blocked = try self.processParsedCommand(conn, done.parts, request_allocator, notifications);
 
                     self.updateReplicationOffset(connection_id, done.kind, done.consumed);
@@ -420,6 +468,7 @@ pub const AppHandler = struct {
             .in_transaction = false,
             .transaction_queue = std.ArrayList(TransactionCommand).init(self.app_allocator),
             .is_replica = false,
+            .pending_replication = std.ArrayList([]const u8).init(self.app_allocator),
             .read_buffer = std.ArrayList(u8).init(self.app_allocator),
             .read_start = 0,
             .parser = StreamParser.init(),
@@ -454,6 +503,7 @@ pub const AppHandler = struct {
             conn.read_buffer.deinit();
             self.clearTransactionQueue(&conn);
             conn.transaction_queue.deinit();
+            self.clearPendingReplication(&conn);
 
             if (conn.blocking_key) |key| {
                 const wait_list = self.blocked_clients_by_key.getPtr(key).?;
@@ -498,6 +548,72 @@ pub const AppHandler = struct {
             self.app_allocator.free(queued.parts);
         }
         conn.transaction_queue.clearRetainingCapacity();
+    }
+
+    fn clearPendingReplication(self: *AppHandler, conn: *ClientConnection) void {
+        for (conn.pending_replication.items) |bytes| {
+            self.app_allocator.free(bytes);
+        }
+        conn.pending_replication.deinit();
+    }
+
+    pub fn resetDataStores(self: *AppHandler) void {
+        self.string_store.clear();
+        self.list_store.clear();
+        self.stream_store.clear();
+    }
+
+    pub fn applyRdbSnapshot(self: *AppHandler, allocator: std.mem.Allocator, bytes: []const u8) !void {
+        self.resetDataStores();
+        try rdb.loadRDBFromBytes(allocator, bytes, self);
+    }
+
+    pub fn beginSnapshotTransfer(self: *AppHandler, connection_id: u64, read_fd: std.posix.fd_t, expected_len: u64, child_pid: std.posix.pid_t) !void {
+        const conn = self.connection_by_id.getPtr(connection_id) orelse return;
+        conn.is_loading_snapshot = true;
+        try self.pending_snapshots.append(.{
+            .connection_id = connection_id,
+            .read_fd = read_fd,
+            .expected_len = @intCast(expected_len),
+            .child_pid = child_pid,
+        });
+    }
+
+    pub fn takePendingSnapshots(self: *AppHandler, allocator: std.mem.Allocator) ![]SnapshotRegistration {
+        const count = self.pending_snapshots.items.len;
+        const out = try allocator.alloc(SnapshotRegistration, count);
+        for (self.pending_snapshots.items, 0..) |item, idx| {
+            out[idx] = item;
+        }
+        self.pending_snapshots.clearRetainingCapacity();
+        return out;
+    }
+
+    pub fn bufferReplicaWrite(self: *AppHandler, connection_id: u64, bytes: []const u8) !void {
+        const conn = self.connection_by_id.getPtr(connection_id) orelse return;
+        if (!conn.is_loading_snapshot) return;
+        const copy = try self.app_allocator.dupe(u8, bytes);
+        errdefer self.app_allocator.free(copy);
+        try conn.pending_replication.append(copy);
+    }
+
+    pub fn takeBufferedReplication(self: *AppHandler, connection_id: u64, allocator: std.mem.Allocator) ![][]const u8 {
+        const conn = self.connection_by_id.getPtr(connection_id) orelse return &[_][]const u8{};
+        const count = conn.pending_replication.items.len;
+        if (count == 0) return &[_][]const u8{};
+
+        const out = try allocator.alloc([]const u8, count);
+        for (conn.pending_replication.items, 0..) |bytes, idx| {
+            out[idx] = bytes;
+        }
+        conn.pending_replication.clearRetainingCapacity();
+        return out;
+    }
+
+    pub fn finishSnapshotLoading(self: *AppHandler, connection_id: u64) void {
+        if (self.connection_by_id.getPtr(connection_id)) |conn| {
+            conn.is_loading_snapshot = false;
+        }
     }
 
     fn ensureStreamWaitList(self: *AppHandler, key: []const u8) !struct {

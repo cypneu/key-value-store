@@ -46,12 +46,20 @@ pub fn Server(comptime H: type) type {
         listener_fd: posix.fd_t,
         quit_fd: posix.fd_t,
         pending_writes: std.AutoHashMap(posix.fd_t, PendingWriteState),
+        snapshot_pipes: std.AutoHashMap(posix.fd_t, SnapshotState),
 
         fd_to_id: std.AutoHashMap(posix.fd_t, u64),
         id_to_fd: std.AutoHashMap(u64, posix.fd_t),
 
         connecting_master_id: ?u64 = null,
         master_listening_port: ?u16 = null,
+
+        const SnapshotState = struct {
+            connection_id: u64,
+            expected_len: usize,
+            sent_len: usize,
+            child_pid: std.posix.pid_t,
+        };
 
         pub fn init(handler: *H, host: []const u8, port: u16, allocator: std.mem.Allocator) !Server(H) {
             var sigmask = posix.empty_sigset;
@@ -86,6 +94,7 @@ pub fn Server(comptime H: type) type {
                 .listener_fd = listener_fd,
                 .quit_fd = quit_fd,
                 .pending_writes = std.AutoHashMap(posix.fd_t, PendingWriteState).init(allocator),
+                .snapshot_pipes = std.AutoHashMap(posix.fd_t, SnapshotState).init(allocator),
                 .fd_to_id = std.AutoHashMap(posix.fd_t, u64).init(allocator),
                 .id_to_fd = std.AutoHashMap(u64, posix.fd_t).init(allocator),
                 .connecting_master_id = null,
@@ -99,6 +108,7 @@ pub fn Server(comptime H: type) type {
                 entry.value_ptr.deinit();
             }
             self.pending_writes.deinit();
+            self.snapshot_pipes.deinit();
             self.fd_to_id.deinit();
             self.id_to_fd.deinit();
             posix.close(self.listener_fd);
@@ -165,26 +175,35 @@ pub fn Server(comptime H: type) type {
                         .client_connected => try self.acceptConnection(),
                         .master_connected => try self.handleMasterConnect(event.data.fd, arena.allocator()),
                         .handle_client => try self.handleClient(event.data.fd, event.events, arena.allocator()),
+                        .snapshot_pipe => try self.handleSnapshotPipe(event.data.fd, arena.allocator()),
                     }
                 }
 
                 const ops = try self.handler.expireDueWaiters(std.time.microTimestamp(), arena.allocator());
                 self.writeOps(ops);
+
+                try self.registerPendingSnapshots();
             }
         }
 
-        const EventAction = enum { master_connected, client_connected, stop_server, handle_client };
+        const EventAction = enum { master_connected, client_connected, stop_server, handle_client, snapshot_pipe };
 
         fn processEvent(self: *Self, fd: i32) EventAction {
             if (fd == self.quit_fd) {
                 return .stop_server;
             } else if (fd == self.listener_fd) {
                 return .client_connected;
+            } else if (self.isSnapshotFd(fd)) {
+                return .snapshot_pipe;
             } else if (self.isConnectingMaster(fd)) {
                 return .master_connected;
             } else {
                 return .handle_client;
             }
+        }
+
+        fn isSnapshotFd(self: *Self, fd: i32) bool {
+            return self.snapshot_pipes.contains(fd);
         }
 
         fn isConnectingMaster(self: *Self, fd: i32) bool {
@@ -253,6 +272,21 @@ pub fn Server(comptime H: type) type {
                     .Blocked => {},
                     .Close => return self.closeConnection(client_fd),
                 }
+            }
+        }
+
+        fn registerPendingSnapshots(self: *Self) !void {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const pending = try self.handler.takePendingSnapshots(arena.allocator());
+            for (pending) |snap| {
+                try self.snapshot_pipes.put(snap.read_fd, .{
+                    .connection_id = snap.connection_id,
+                    .expected_len = snap.expected_len,
+                    .sent_len = 0,
+                    .child_pid = snap.child_pid,
+                });
+                try addFdToEpoll(self.epoll_fd, snap.read_fd, EPOLL.IN);
             }
         }
 
@@ -372,6 +406,53 @@ pub fn Server(comptime H: type) type {
             };
             try posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, fd, &event);
             state.write_interest = enabled;
+        }
+
+        fn handleSnapshotPipe(self: *Self, pipe_fd: posix.fd_t, allocator: std.mem.Allocator) !void {
+            const snap_ptr = self.snapshot_pipes.getPtr(pipe_fd) orelse {
+                posix.close(pipe_fd);
+                return;
+            };
+
+            const conn_fd = self.id_to_fd.get(snap_ptr.connection_id) orelse {
+                posix.close(pipe_fd);
+                _ = self.snapshot_pipes.remove(pipe_fd);
+                return;
+            };
+
+            var buf: [4096]u8 = undefined;
+            const nread = posix.read(pipe_fd, &buf) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => return self.closeConnection(conn_fd),
+            };
+
+            if (nread > 0) {
+                snap_ptr.sent_len += nread;
+                self.appendWriteBuffer(conn_fd, buf[0..nread]);
+            }
+
+            if (nread == 0 or snap_ptr.sent_len >= snap_ptr.expected_len) {
+                const conn_id = snap_ptr.connection_id;
+                self.appendWriteBuffer(conn_fd, "\r\n");
+
+                posix.close(pipe_fd);
+                const child_pid = snap_ptr.child_pid;
+                _ = self.snapshot_pipes.remove(pipe_fd);
+                _ = posix.waitpid(child_pid, 0);
+
+                self.handler.finishSnapshotLoading(conn_id);
+
+                const buffered = try self.handler.takeBufferedReplication(conn_id, allocator);
+                defer {
+                    for (buffered) |b| self.handler.app_allocator.free(b);
+                }
+
+                for (buffered) |bytes| {
+                    self.appendWriteBuffer(conn_fd, bytes);
+                }
+
+                _ = self.flushPendingWritesForEvent(conn_fd);
+            }
         }
     };
 }

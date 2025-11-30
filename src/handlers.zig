@@ -7,6 +7,7 @@ const Reply = @import("reply.zig").Reply;
 const ErrorKind = @import("reply.zig").ErrorKind;
 const WriteOp = @import("state.zig").WriteOp;
 const replication = @import("replication.zig");
+const rdb = @import("rdb.zig");
 
 const DEFAULT_REPL_ID = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
 const INFO_MASTER = "role:master\r\nmaster_replid:" ++ DEFAULT_REPL_ID ++ "\r\nmaster_repl_offset:0\r\n";
@@ -395,8 +396,6 @@ pub fn handleWait(
 
     const replica_ids = if (handler.replicas.items.len != 0) handler.replicas.items else replica_ids_buffer.items;
 
-    const total_replicas: u64 = @intCast(replica_ids.len);
-
     var acked_count: u64 = 0;
     for (replica_ids) |rid| {
         const ack = handler.replicaAck(rid);
@@ -406,7 +405,7 @@ pub fn handleWait(
     }
     const acked = acked_count;
 
-    if (acked >= required or total_replicas == 0 or acked == total_replicas or timeout_ms == 0) {
+    if (acked >= required or timeout_ms == 0) {
         return .{ .Value = Reply{ .Integer = @intCast(acked) } };
     }
 
@@ -723,22 +722,38 @@ pub fn handleReplconf(allocator: std.mem.Allocator, handler: *AppHandler, args: 
 pub fn handlePsync(allocator: std.mem.Allocator, handler: *AppHandler, connection: *ClientConnection, args: [64]?[]const u8) !Reply {
     _ = args;
 
-    const empty_rdb_base64 = "UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZWXCUIhuAPoIYW9mLWJhc2XAAP/wbjv+wP9aog==";
+    const pipe = try rdb.forkSnapshotPipe(handler);
 
-    const size = try std.base64.standard.Decoder.calcSizeForSlice(empty_rdb_base64);
+    var len_buf: [8]u8 = undefined;
+    {
+        var total_read: usize = 0;
+        while (total_read < len_buf.len) {
+            const n = try std.posix.read(pipe.read_fd, len_buf[total_read..]);
+            if (n == 0) return error.UnexpectedEOF;
+            total_read += n;
+        }
+    }
+    const snapshot_len = std.mem.readInt(u64, &len_buf, .little);
 
-    const rdb_bytes = try allocator.alloc(u8, size);
+    // Make pipe non-blocking for event loop streaming.
+    const flags = try std.posix.fcntl(pipe.read_fd, std.posix.F.GETFL, 0);
+    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = try std.posix.fcntl(pipe.read_fd, std.posix.F.SETFL, flags | nonblock);
 
-    try std.base64.standard.Decoder.decode(rdb_bytes, empty_rdb_base64);
+    try handler.beginSnapshotTransfer(connection.id, pipe.read_fd, snapshot_len, pipe.child_pid);
 
     var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
 
-    try buf.appendSlice("+FULLRESYNC " ++ DEFAULT_REPL_ID ++ " 0\r\n");
+    const repl_offset = handler.replication_offset;
+    var offset_buf: [32]u8 = undefined;
+    const offset_slice = try std.fmt.bufPrint(&offset_buf, "{d}", .{repl_offset});
 
-    try buf.writer().print("${d}\r\n", .{rdb_bytes.len});
-
-    try buf.appendSlice(rdb_bytes);
+    try buf.appendSlice("+FULLRESYNC " ++ DEFAULT_REPL_ID ++ " ");
+    try buf.appendSlice(offset_slice);
     try buf.appendSlice("\r\n");
+
+    try buf.writer().print("${d}\r\n", .{snapshot_len});
 
     if (!connection.is_replica) {
         connection.is_replica = true;
