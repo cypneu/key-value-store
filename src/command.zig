@@ -25,6 +25,7 @@ pub const Command = enum {
     WAIT,
     CONFIG,
     KEYS,
+    SAVE,
 
     pub fn fromSlice(slice: []const u8) ?Command {
         if (std.ascii.eqlIgnoreCase(slice, "PING")) return .PING;
@@ -51,6 +52,7 @@ pub const Command = enum {
         if (std.ascii.eqlIgnoreCase(slice, "WAIT")) return .WAIT;
         if (std.ascii.eqlIgnoreCase(slice, "CONFIG")) return .CONFIG;
         if (std.ascii.eqlIgnoreCase(slice, "KEYS")) return .KEYS;
+        if (std.ascii.eqlIgnoreCase(slice, "SAVE")) return .SAVE;
         return null;
     }
 };

@@ -823,3 +823,28 @@ pub fn handleKeys(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]
 
     return try stringArrayReply(allocator, merged);
 }
+
+pub fn handleSave(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]?[]const u8) !Reply {
+    _ = args;
+
+    const tmp_filename = try std.fmt.allocPrint(allocator, "temp-{d}.rdb", .{std.time.milliTimestamp()});
+    defer allocator.free(tmp_filename);
+
+    const tmp_path = try std.fs.path.join(allocator, &[_][]const u8{ handler.dir, tmp_filename });
+    defer allocator.free(tmp_path);
+
+    const target_path = try std.fs.path.join(allocator, &[_][]const u8{ handler.dir, handler.db_filename });
+    defer allocator.free(target_path);
+
+    {
+        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        defer file.close();
+        var buf_writer = std.io.bufferedWriter(file.writer());
+        try rdb.writeSnapshot(buf_writer.writer(), allocator, handler);
+        try buf_writer.flush();
+    }
+
+    try std.fs.cwd().rename(tmp_path, target_path);
+
+    return Reply{ .SimpleString = "OK" };
+}

@@ -128,6 +128,7 @@ fn executeCommand(
         .PSYNC => .{ .reply = try handlers.handlePsync(allocator, handler, client_connection, command_parts), .notify = &.{} },
         .CONFIG => .{ .reply = try handlers.handleConfig(allocator, handler, command_parts), .notify = &.{} },
         .KEYS => .{ .reply = try handlers.handleKeys(allocator, handler, command_parts), .notify = &.{} },
+        .SAVE => .{ .reply = try handlers.handleSave(allocator, handler, command_parts), .notify = &.{} },
         else => unreachable,
     };
 }

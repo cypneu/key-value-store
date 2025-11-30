@@ -4,7 +4,6 @@ import socket
 import subprocess
 import time
 import tempfile
-import os
 from pathlib import Path
 from typing import NamedTuple
 
@@ -38,10 +37,12 @@ class RedisServer:
         # Check for memory leaks
         if self.proc.returncode != 0:
             self.stderr_file.seek(0)
-            stderr_output = self.stderr_file.read().decode('utf-8', errors='replace')
-            
+            stderr_output = self.stderr_file.read().decode("utf-8", errors="replace")
+
             if "Memory leak detected" in stderr_output:
-                raise RuntimeError(f"Memory leak detected in server on port {self.port}!\nLogs:\n{stderr_output}")
+                raise RuntimeError(
+                    f"Memory leak detected in server on port {self.port}!\nLogs:\n{stderr_output}"
+                )
 
     def cleanup(self):
         self.close()
@@ -71,12 +72,8 @@ def server_factory():
 
         # Use a temporary file for stderr to avoid buffer filling issues
         stderr_file = tempfile.TemporaryFile()
-        
-        proc = subprocess.Popen(
-            cmd, 
-            cwd=str(ROOT),
-            stderr=stderr_file
-        )
+
+        proc = subprocess.Popen(cmd, cwd=str(ROOT), stderr=stderr_file)
         server = RedisServer(proc, port, stderr_file)
         servers.append(server)
 
@@ -129,6 +126,7 @@ def _find_free_port() -> int:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
+
 def _wait_for_port(host: str, port: int, deadline: float) -> None:
     while time.time() < deadline:
         try:
@@ -137,3 +135,4 @@ def _wait_for_port(host: str, port: int, deadline: float) -> None:
         except OSError:
             time.sleep(0.02)
     raise TimeoutError(f"Timed out waiting for {host}:{port} to be ready")
+

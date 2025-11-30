@@ -25,12 +25,17 @@ pub fn generateSnapshot(allocator: std.mem.Allocator, handler: anytype) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
 
-    var writer = buf.writer();
+    try writeSnapshot(buf.writer(), allocator, handler);
+
+    return try buf.toOwnedSlice();
+}
+
+pub fn writeSnapshot(writer: anytype, allocator: std.mem.Allocator, handler: anytype) !void {
     try writer.writeAll(RDB_VERSION);
 
     // Select default DB
     try writer.writeByte(0xFE);
-    try writeLength(&writer, DEFAULT_DB_INDEX);
+    try writeLength(writer, DEFAULT_DB_INDEX);
 
     // Strings (with expirations)
     const string_keys = try handler.string_store.keys(allocator);
@@ -47,8 +52,8 @@ pub fn generateSnapshot(allocator: std.mem.Allocator, handler: anytype) ![]u8 {
         }
 
         try writer.writeByte(RDB_TYPE_STRING);
-        try writeString(&writer, key);
-        try writeString(&writer, entry.data);
+        try writeString(writer, key);
+        try writeString(writer, entry.data);
     }
 
     // Lists
@@ -60,12 +65,12 @@ pub fn generateSnapshot(allocator: std.mem.Allocator, handler: anytype) ![]u8 {
         if (length == 0) continue;
 
         try writer.writeByte(RDB_TYPE_LIST);
-        try writeString(&writer, key);
-        try writeLength(&writer, length);
+        try writeString(writer, key);
+        try writeLength(writer, length);
 
         const view = handler.list_store.lrange(key, 0, @as(i64, @intCast(length)) - 1);
-        for (view.first) |item| try writeString(&writer, item);
-        for (view.second) |item| try writeString(&writer, item);
+        for (view.first) |item| try writeString(writer, item);
+        for (view.second) |item| try writeString(writer, item);
     }
 
     // Streams
@@ -82,36 +87,34 @@ pub fn generateSnapshot(allocator: std.mem.Allocator, handler: anytype) ![]u8 {
         if (entries.len == 0) continue;
 
         try writer.writeByte(RDB_TYPE_STREAM_LISTPACKS);
-        try writeString(&writer, key);
+        try writeString(writer, key);
 
         // One listpack per stream
-        try writeLength(&writer, 1);
+        try writeLength(writer, 1);
 
         const base_id = entries[0].*.id;
         var master_id: [16]u8 = undefined;
         std.mem.writeInt(u64, master_id[0..8], base_id.milliseconds, .big);
         std.mem.writeInt(u64, master_id[8..16], base_id.sequence, .big);
-        try writeString(&writer, &master_id);
+        try writeString(writer, &master_id);
 
         const lp_bytes = try encodeStreamListpack(allocator, base_id, entries);
         defer allocator.free(lp_bytes);
-        try writeString(&writer, lp_bytes);
+        try writeString(writer, lp_bytes);
 
         const last_id = entries[entries.len - 1].*.id;
-        try writeLength(&writer, entries.len);
-        try writeLength(&writer, last_id.milliseconds);
-        try writeLength(&writer, last_id.sequence);
+        try writeLength(writer, entries.len);
+        try writeLength(writer, last_id.milliseconds);
+        try writeLength(writer, last_id.sequence);
 
         // Consumer groups: none
-        try writeLength(&writer, 0);
+        try writeLength(writer, 0);
     }
 
     // EOF
     try writer.writeByte(0xFF);
     var checksum_buf = [_]u8{0} ** 8;
     try writer.writeAll(&checksum_buf); // checksum placeholder
-
-    return try buf.toOwnedSlice();
 }
 
 pub const SnapshotPipe = struct {
@@ -242,10 +245,26 @@ const ListpackBuilder = struct {
     }
 
     fn appendBacklen(self: *ListpackBuilder, element_len: usize) !void {
-        const bl_size: usize = if (element_len <= 127) 1 else if (element_len < 16383) 2 else if (element_len < 2097151) 3 else if (element_len < 268435455) 4 else 5;
-        var i: usize = 0;
-        while (i < bl_size) : (i += 1) {
-            try self.buf.append(0);
+        if (element_len <= 127) {
+            try self.buf.append(@intCast(element_len));
+        } else if (element_len < 16383) {
+            try self.buf.append(@intCast(element_len >> 7));
+            try self.buf.append(@intCast((element_len & 127) | 128));
+        } else if (element_len < 2097151) {
+            try self.buf.append(@intCast(element_len >> 14));
+            try self.buf.append(@intCast(((element_len >> 7) & 127) | 128));
+            try self.buf.append(@intCast((element_len & 127) | 128));
+        } else if (element_len < 268435455) {
+            try self.buf.append(@intCast(element_len >> 21));
+            try self.buf.append(@intCast(((element_len >> 14) & 127) | 128));
+            try self.buf.append(@intCast(((element_len >> 7) & 127) | 128));
+            try self.buf.append(@intCast((element_len & 127) | 128));
+        } else {
+            try self.buf.append(@intCast(element_len >> 28));
+            try self.buf.append(@intCast(((element_len >> 21) & 127) | 128));
+            try self.buf.append(@intCast(((element_len >> 14) & 127) | 128));
+            try self.buf.append(@intCast(((element_len >> 7) & 127) | 128));
+            try self.buf.append(@intCast((element_len & 127) | 128));
         }
     }
 

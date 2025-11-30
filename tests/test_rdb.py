@@ -1,89 +1,58 @@
-import struct
-import time
+import pytest
+from pathlib import Path
 from .utils import encode_command, read_reply
 
-
-def create_rdb_file(path, keys):
-    # Header
-    data = b"REDIS0011"
-
-    # DB Selector
-    data += b"\xfe\x00"
-
-    # Resize DB
-    data += b"\xfb" + struct.pack("B", len(keys)) + b"\x00"
-
-    items = []
-    if isinstance(keys, dict):
-        for k, v in keys.items():
-            items.append((k, v, None))
-    else:
-        items = keys
-
-    for k, v, expiry in items:
-        # Expiry
-        if expiry is not None:
-            # Use millisecond expiry (0xFC)
-            data += b"\xfc" + struct.pack("<Q", expiry)
-
-        # Type String (0)
-        data += b"\x00"
-        # Key
-        data += struct.pack("B", len(k)) + k.encode()
-        # Value
-        data += struct.pack("B", len(v)) + v.encode()
-
-    # EOF
-    data += b"\xff"
-    # Checksum (8 bytes)
-    data += b"\x00" * 8
-
-    with open(path, "wb") as f:
-        f.write(data)
+ASSETS_DIR = Path(__file__).parent / "assets"
 
 
-def test_rdb_load_single_key(server_factory, tmp_path):
-    rdb_dir = tmp_path / "redis-data"
-    rdb_dir.mkdir()
-    rdb_file = "dump.rdb"
-    rdb_path = rdb_dir / rdb_file
+def test_rdb_load_many_small(server_factory):
+    rdb_file = ASSETS_DIR / "many_small.rdb"
+    if not rdb_file.exists():
+        pytest.skip("many_small.rdb not found")
 
-    create_rdb_file(rdb_path, {"foo": "bar"})
-
-    server = server_factory(args=["--dir", str(rdb_dir), "--dbfilename", rdb_file])
+    server = server_factory(
+        args=["--dir", str(ASSETS_DIR), "--dbfilename", "many_small.rdb"]
+    )
 
     with server.client() as s:
-        s.sendall(encode_command("KEYS", "*"))
+        s.sendall(encode_command("GET", "str_0"))
+        assert read_reply(s) == "val_0"
+        s.sendall(encode_command("GET", "str_999"))
+        assert read_reply(s) == "val_999"
+
+        s.sendall(encode_command("LRANGE", "list_0", "0", "-1"))
         reply = read_reply(s)
-        # Order is not guaranteed for KEYS *, but with one key it is.
-        assert reply == ["foo"]
+        assert len(reply) == 10
+        assert reply[0] == "item_0"
 
-        s.sendall(encode_command("GET", "foo"))
+        s.sendall(encode_command("XRANGE", "stream_0", "-", "+"))
         reply = read_reply(s)
-        assert reply == "bar"
+        assert len(reply) == 5
+
+        assert reply[0][0] == "1000-0"
+        assert reply[0][1] == ["field", "val_0"]
 
 
-def test_rdb_load_multiple_keys(server_factory, tmp_path):
-    rdb_dir = tmp_path / "redis-data"
-    rdb_dir.mkdir()
-    rdb_file = "dump.rdb"
-    rdb_path = rdb_dir / rdb_file
+def test_rdb_load_few_large(server_factory):
+    rdb_file = ASSETS_DIR / "few_large.rdb"
+    if not rdb_file.exists():
+        pytest.skip("few_large.rdb not found")
 
-    keys = {"key1": "val1", "key2": "val2", "key3": "val3"}
-    create_rdb_file(rdb_path, keys)
-
-    server = server_factory(args=["--dir", str(rdb_dir), "--dbfilename", rdb_file])
+    server = server_factory(
+        args=["--dir", str(ASSETS_DIR), "--dbfilename", "few_large.rdb"]
+    )
 
     with server.client() as s:
-        s.sendall(encode_command("KEYS", "*"))
-        reply = read_reply(s)
-        assert isinstance(reply, list)
-        assert len(reply) == 3
-        assert set(reply) == set(keys.keys())
+        s.sendall(encode_command("GET", "large_str"))
+        val = read_reply(s)
+        assert len(val) == 1_000_000
 
-        for k, v in keys.items():
-            s.sendall(encode_command("GET", k))
-            assert read_reply(s) == v
+        s.sendall(encode_command("LLEN", "large_list"))
+        assert read_reply(s) == 10_000
+
+        s.sendall(encode_command("XRANGE", "large_stream", "-", "+"))
+        entries = read_reply(s)
+        assert len(entries) == 5000
 
 
 def test_rdb_non_existent_file(server_factory, tmp_path):
@@ -98,38 +67,24 @@ def test_rdb_non_existent_file(server_factory, tmp_path):
         assert reply == []
 
 
-def test_rdb_expiry(server_factory, tmp_path):
-    rdb_dir = tmp_path / "redis-data"
+def test_save_command(server_factory, tmp_path):
+    rdb_dir = tmp_path / "redis-data-save"
     rdb_dir.mkdir()
-    rdb_file = "dump.rdb"
-    rdb_path = rdb_dir / rdb_file
+    rdb_filename = "dump-save.rdb"
 
-    now_ms = int(time.time() * 1000)
-    past_ms = now_ms - 10000  # 10 seconds ago
-    future_ms = now_ms + 10000  # 10 seconds in future
-
-    items = [
-        ("no_expiry", "val_no", None),
-        ("expired", "val_exp", past_ms),
-        ("active", "val_act", future_ms),
-    ]
-
-    create_rdb_file(rdb_path, items)
-
-    server = server_factory(args=["--dir", str(rdb_dir), "--dbfilename", rdb_file])
+    server = server_factory(args=["--dir", str(rdb_dir), "--dbfilename", rdb_filename])
 
     with server.client() as s:
-        # Test no expiry
-        s.sendall(encode_command("GET", "no_expiry"))
-        reply = read_reply(s)
-        assert reply == "val_no"
+        s.sendall(encode_command("SET", "save_key", "save_val"))
+        assert read_reply(s) == "OK"
 
-        # Test expired
-        s.sendall(encode_command("GET", "expired"))
-        reply = read_reply(s)
-        assert reply is None  # Null bulk string
+        s.sendall(encode_command("SAVE"))
+        assert read_reply(s) == "OK"
 
-        # Test active (future expiry)
-        s.sendall(encode_command("GET", "active"))
-        reply = read_reply(s)
-        assert reply == "val_act"
+    assert (rdb_dir / rdb_filename).exists()
+
+    server2 = server_factory(args=["--dir", str(rdb_dir), "--dbfilename", rdb_filename])
+    with server2.client() as s:
+        s.sendall(encode_command("GET", "save_key"))
+        assert read_reply(s) == "save_val"
+
