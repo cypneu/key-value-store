@@ -4,7 +4,7 @@ const dispatcher = @import("dispatcher.zig");
 const format = @import("resp/format.zig");
 const Reply = @import("reply.zig").Reply;
 const Command = @import("command.zig").Command;
-const rdb = @import("rdb.zig");
+const rdb_loader = @import("rdb/loader.zig");
 const Order = std.math.Order;
 const StreamParser = @import("resp/stream_parser.zig").StreamParser;
 const StreamReadRequest = @import("handlers.zig").StreamReadRequest;
@@ -565,7 +565,7 @@ pub const AppHandler = struct {
 
     pub fn applyRdbSnapshot(self: *AppHandler, allocator: std.mem.Allocator, bytes: []const u8) !void {
         self.resetDataStores();
-        try rdb.loadRDBFromBytes(allocator, bytes, self);
+        try rdb_loader.loadRDBFromBytes(allocator, bytes, self);
     }
 
     pub fn beginSnapshotTransfer(self: *AppHandler, connection_id: u64, read_fd: std.posix.fd_t, expected_len: u64, child_pid: std.posix.pid_t) !void {

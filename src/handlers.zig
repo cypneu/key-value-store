@@ -7,7 +7,7 @@ const Reply = @import("reply.zig").Reply;
 const ErrorKind = @import("reply.zig").ErrorKind;
 const WriteOp = @import("state.zig").WriteOp;
 const replication = @import("replication.zig");
-const rdb = @import("rdb.zig");
+const rdb_writer = @import("rdb/writer.zig");
 
 const DEFAULT_REPL_ID = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
 const INFO_MASTER = "role:master\r\nmaster_replid:" ++ DEFAULT_REPL_ID ++ "\r\nmaster_repl_offset:0\r\n";
@@ -722,7 +722,7 @@ pub fn handleReplconf(allocator: std.mem.Allocator, handler: *AppHandler, args: 
 pub fn handlePsync(allocator: std.mem.Allocator, handler: *AppHandler, connection: *ClientConnection, args: [64]?[]const u8) !Reply {
     _ = args;
 
-    const pipe = try rdb.forkSnapshotPipe(handler);
+    const pipe = try rdb_writer.forkSnapshotPipe(handler);
 
     var len_buf: [8]u8 = undefined;
     {
@@ -840,7 +840,7 @@ pub fn handleSave(allocator: std.mem.Allocator, handler: *AppHandler, args: [64]
         const file = try std.fs.cwd().createFile(tmp_path, .{});
         defer file.close();
         var buf_writer = std.io.bufferedWriter(file.writer());
-        try rdb.writeSnapshot(buf_writer.writer(), allocator, handler);
+        try rdb_writer.writeSnapshot(buf_writer.writer(), allocator, handler);
         try buf_writer.flush();
     }
 

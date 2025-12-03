@@ -1,5 +1,6 @@
 const std = @import("std");
 const server = @import("server.zig");
+const rdb_loader = @import("rdb/loader.zig");
 const db = @import("data_structures/mod.zig");
 const logger = @import("log.zig");
 const Command = @import("command.zig").Command;
@@ -49,9 +50,8 @@ pub fn main() !void {
     var app_handler = AppHandler.init(allocator, &string_store, &list_store, &stream_store, config.role, config.replica, config.dir, config.db_filename);
     defer app_handler.deinit();
 
-    const rdb = @import("rdb.zig");
-    rdb.loadRDB(allocator, config.dir, config.db_filename, &app_handler) catch |err| {
-        log.warn("Failed to load RDB file: {}", .{err});
+    rdb_loader.loadRDB(allocator, config.dir, config.db_filename, &app_handler) catch |err| {
+        log.warn("Failed to load rdb file: {}", .{err});
     };
 
     var server_instance = try server.Server(AppHandler).init(&app_handler, "0.0.0.0", config.port, allocator);
@@ -176,4 +176,10 @@ fn parseConfig(allocator: std.mem.Allocator) !Config {
     }
 
     return builder.build();
+}
+
+test {
+    _ = @import("rdb/listpack.zig");
+    _ = @import("rdb/lzf.zig");
+    _ = @import("rdb/writer.zig");
 }
