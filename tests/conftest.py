@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
+from .utils import encode_command, read_reply
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "zig-out" / "bin" / "main"
@@ -110,6 +111,9 @@ def cluster(request, server_factory) -> RedisCluster:
         )
         replica_servers.append(replica)
 
+    for replica in replica_servers:
+        _wait_for_replica_ready(replica)
+
     return RedisCluster(master=master_server, replicas=replica_servers)
 
 
@@ -136,3 +140,17 @@ def _wait_for_port(host: str, port: int, deadline: float) -> None:
             time.sleep(0.02)
     raise TimeoutError(f"Timed out waiting for {host}:{port} to be ready")
 
+
+def _wait_for_replica_ready(replica: RedisServer, timeout: float = 5.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with replica.client(timeout=0.5) as client:
+                client.sendall(encode_command("GET", "__replica_ready_probe"))
+                read_reply(client)
+                return
+        except RuntimeError as e:
+            if "LOADING" not in str(e):
+                raise
+        time.sleep(0.05)
+    raise TimeoutError(f"Timed out waiting for replica on port {replica.port} to load")

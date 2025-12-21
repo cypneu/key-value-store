@@ -1,3 +1,4 @@
+import struct
 import pytest
 from pathlib import Path
 from .utils import encode_command, read_reply
@@ -67,6 +68,26 @@ def test_rdb_non_existent_file(server_factory, tmp_path):
         assert reply == []
 
 
+def test_rdb_negative_integer_encoding(server_factory, tmp_path):
+    rdb_path = tmp_path / "neg-int.rdb"
+    key = b"neg"
+
+    rdb = bytearray()
+    rdb += b"REDIS0012"
+    rdb += bytes([0xFE, 0x00])
+    rdb += bytes([0x00])
+    rdb += bytes([len(key)]) + key
+    rdb += bytes([0xC0]) + struct.pack("b", -1)
+    rdb += bytes([0xFF]) + b"\x00" * 8
+
+    rdb_path.write_bytes(rdb)
+
+    server = server_factory(args=["--dir", str(tmp_path), "--dbfilename", rdb_path.name])
+    with server.client() as s:
+        s.sendall(encode_command("GET", "neg"))
+        assert read_reply(s) == "-1"
+
+
 def test_save_command(server_factory, tmp_path):
     rdb_dir = tmp_path / "redis-data-save"
     rdb_dir.mkdir()
@@ -87,4 +108,3 @@ def test_save_command(server_factory, tmp_path):
     with server2.client() as s:
         s.sendall(encode_command("GET", "save_key"))
         assert read_reply(s) == "save_val"
-

@@ -38,6 +38,15 @@ def test_wait_returns_connected_replica_count(cluster):
 
 @pytest.mark.parametrize("cluster", [{"replicas": 2}], indirect=True)
 def test_wait_after_write(cluster):
+    expected = len(cluster.replicas)
+    with cluster.master.client() as client:
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            client.sendall(encode_command("WAIT", "0", "0"))
+            if read_reply(client) >= expected:
+                break
+            time.sleep(0.05)
+
     with cluster.master.client() as client:
         client.sendall(encode_command("SET", "foo", "bar"))
         assert read_reply(client) == "OK"
@@ -83,3 +92,25 @@ def _connect_fake_replica(master):
 
     conn.read_rdb()
     return conn
+
+
+def test_wait_tracks_writes_before_replica_connects(server_factory):
+    master = server_factory()
+
+    with master.client() as client:
+        for i in range(3):
+            client.sendall(encode_command("SET", f"preconnect_key_{i}", f"value_{i}"))
+            assert read_reply(client) == "OK"
+
+    replica = _connect_fake_replica(master)
+
+    try:
+        with master.client() as client:
+            client.sendall(encode_command("WAIT", "1", "100"))
+            reply = read_reply(client)
+
+            assert reply == 0, (
+                f"WAIT should return 0 (replica hasn't ACKed pre-connection writes), got {reply}"
+            )
+    finally:
+        replica.sock.close()

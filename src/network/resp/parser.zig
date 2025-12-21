@@ -1,21 +1,19 @@
 const std = @import("std");
 
 pub const StreamParser = struct {
-    const max_parts = 64;
-
     pub const Error = error{
         NotArray,
         MissingArraySize,
         MissingCLRF,
-        TooManyArgs,
         Overflow,
+        OutOfMemory,
     };
 
     pub const MessageKind = enum { Array, SimpleString, TopLevelBulk };
 
     pub const ParseResult = union(enum) {
         NeedMore,
-        Done: struct { consumed: usize, parts: [max_parts]?[]const u8, kind: MessageKind },
+        Done: struct { consumed: usize, parts: []const []const u8, kind: MessageKind },
         Error: Error,
     };
 
@@ -38,13 +36,15 @@ pub const StreamParser = struct {
         SimpleStringLF,
     };
 
+    allocator: std.mem.Allocator,
+    args_idx: std.ArrayList(PartIndex),
+    parts: std.ArrayList([]const u8),
+
     state: State = .ExpectStart,
     mode: MessageKind = .Array,
     cursor: usize = 0,
 
     array_len: usize = 0,
-    args_idx: [max_parts]?PartIndex = .{null} ** max_parts,
-    args_count: usize = 0,
 
     num_acc: u64 = 0,
     num_had_digit: bool = false,
@@ -116,8 +116,8 @@ pub const StreamParser = struct {
 
         while (i < buf.len) {
             if (buf[i] == '\r') {
-                self.args_idx[0] = PartIndex{ .start = self.simple_string_start, .len = i - self.simple_string_start };
-                self.args_count = 1;
+                self.clearArgState();
+                self.args_idx.append(PartIndex{ .start = self.simple_string_start, .len = i - self.simple_string_start }) catch return .{ .Error = Error.OutOfMemory };
 
                 i += 1;
                 self.state = .SimpleStringLF;
@@ -186,9 +186,10 @@ pub const StreamParser = struct {
         if (buf[i] != '\n') return .{ .Error = Error.MissingCLRF };
         i += 1;
 
-        if (self.num_acc > max_parts) return .{ .Error = Error.TooManyArgs };
+        if (self.num_acc > @as(u64, std.math.maxInt(usize))) return .{ .Error = Error.Overflow };
         self.array_len = @intCast(self.num_acc);
         self.clearArgState();
+        self.args_idx.ensureTotalCapacity(self.array_len) catch return .{ .Error = Error.OutOfMemory };
         self.state = .ExpectArgOrDone;
 
         idx_ptr.* = i;
@@ -251,6 +252,7 @@ pub const StreamParser = struct {
         if (buf[i] != '\n') return .{ .Error = Error.MissingCLRF };
         i += 1;
 
+        if (self.num_acc > @as(u64, std.math.maxInt(usize))) return .{ .Error = Error.Overflow };
         self.bulk_remaining = @intCast(self.num_acc);
         self.state = .BulkData;
         idx_ptr.* = i;
@@ -262,7 +264,7 @@ pub const StreamParser = struct {
 
         if (self.bulk_remaining == 0) {
             const start = i;
-            self.args_idx[self.args_count] = PartIndex{ .start = start, .len = 0 };
+            self.args_idx.append(PartIndex{ .start = start, .len = 0 }) catch return .{ .Error = Error.OutOfMemory };
             self.bulk_remaining = 0;
             self.state = .BulkCR;
             idx_ptr.* = i;
@@ -274,7 +276,7 @@ pub const StreamParser = struct {
 
         const start = i;
         const end = i + self.bulk_remaining;
-        self.args_idx[self.args_count] = PartIndex{ .start = start, .len = end - start };
+        self.args_idx.append(PartIndex{ .start = start, .len = end - start }) catch return .{ .Error = Error.OutOfMemory };
         i = end;
         self.bulk_remaining = 0;
 
@@ -301,12 +303,10 @@ pub const StreamParser = struct {
         if (buf[i] != '\n') return .{ .Error = Error.MissingCLRF };
         i += 1;
 
-        self.args_count += 1;
-
         if (self.mode == .TopLevelBulk) {
             return self.finishMessage(buf, i);
         } else {
-            if (self.args_count == self.array_len) {
+            if (self.args_idx.items.len == self.array_len) {
                 return self.finishMessage(buf, i);
             }
             self.state = .ExpectBulkStart;
@@ -317,13 +317,13 @@ pub const StreamParser = struct {
     }
 
     fn finishMessage(self: *StreamParser, buf: []const u8, consumed: usize) ParseResult {
-        const count = self.args_count;
         const kind = self.mode;
-        var parts: [max_parts]?[]const u8 = .{null} ** max_parts;
-        var idx: usize = 0;
-        while (idx < count) : (idx += 1) {
-            const entry = self.args_idx[idx].?;
-            parts[idx] = buf[entry.start .. entry.start + entry.len];
+        const count = self.args_idx.items.len;
+
+        self.parts.clearRetainingCapacity();
+        self.parts.ensureTotalCapacity(count) catch return .{ .Error = Error.OutOfMemory };
+        for (self.args_idx.items) |entry| {
+            self.parts.appendAssumeCapacity(buf[entry.start .. entry.start + entry.len]);
         }
 
         self.cursor = consumed;
@@ -332,15 +332,33 @@ pub const StreamParser = struct {
         self.array_len = 0;
         self.bulk_remaining = 0;
         self.clearArgState();
-        return .{ .Done = .{ .consumed = consumed, .parts = parts, .kind = kind } };
+        return .{ .Done = .{ .consumed = consumed, .parts = self.parts.items, .kind = kind } };
     }
 
-    pub fn init() StreamParser {
-        return .{};
+    pub fn init(allocator: std.mem.Allocator) StreamParser {
+        return .{
+            .allocator = allocator,
+            .args_idx = std.ArrayList(PartIndex).init(allocator),
+            .parts = std.ArrayList([]const u8).init(allocator),
+        };
     }
 
     pub fn reset(self: *StreamParser) void {
-        self.* = .{};
+        self.state = .ExpectStart;
+        self.mode = .Array;
+        self.cursor = 0;
+        self.array_len = 0;
+        self.args_idx.clearRetainingCapacity();
+        self.parts.clearRetainingCapacity();
+        self.num_acc = 0;
+        self.num_had_digit = false;
+        self.bulk_remaining = 0;
+        self.simple_string_start = 0;
+    }
+
+    pub fn deinit(self: *StreamParser) void {
+        self.args_idx.deinit();
+        self.parts.deinit();
     }
 
     inline fn needMore(self: *StreamParser, idx: usize) ParseResult {
@@ -354,7 +372,6 @@ pub const StreamParser = struct {
     }
 
     inline fn clearArgState(self: *StreamParser) void {
-        self.args_idx = .{null} ** max_parts;
-        self.args_count = 0;
+        self.args_idx.clearRetainingCapacity();
     }
 };

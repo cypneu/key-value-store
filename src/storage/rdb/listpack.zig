@@ -203,4 +203,3 @@ test "listpack mixed" {
     defer std.testing.allocator.free(v2);
     try std.testing.expectEqualStrings("foo", v2);
 }
-

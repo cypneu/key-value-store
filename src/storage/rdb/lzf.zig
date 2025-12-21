@@ -127,4 +127,3 @@ test "lzf error output too small" {
     var out: [0]u8 = undefined;
     try std.testing.expectError(types.RdbError.LzfOutputTooSmall, decompress(&in, &out));
 }
-

@@ -1,8 +1,8 @@
 const std = @import("std");
-const db = @import("../data_structures/mod.zig");
+const reply_mod = @import("../../commands/reply.zig");
 
-const Reply = @import("../reply.zig").Reply;
-const ErrorKind = @import("../reply.zig").ErrorKind;
+pub const ErrorKind = reply_mod.ErrorKind;
+pub const Reply = reply_mod.Reply;
 
 pub fn writeReply(writer: anytype, r: Reply) !void {
     switch (r) {
@@ -30,10 +30,19 @@ pub fn writeReply(writer: anytype, r: Reply) !void {
                 .ExecWithoutMulti => "ERR EXEC without MULTI",
                 .DiscardWithoutMulti => "ERR DISCARD without MULTI",
                 .NestedMulti => "ERR MULTI calls can not be nested",
+                .ExecAbort => "EXECABORT Transaction discarded because of previous errors.",
                 .UnknownCommand => "ERR unknown command",
+                .Loading => "LOADING Redis is loading the dataset in memory",
             };
             try writer.print("-{s}\r\n", .{msg});
         },
         .Bytes => |b| try writer.writeAll(b),
     }
+}
+
+pub fn renderReply(allocator: std.mem.Allocator, reply: Reply) ![]const u8 {
+    var response_buffer = std.ArrayList(u8).init(allocator);
+    errdefer response_buffer.deinit();
+    try writeReply(response_buffer.writer(), reply);
+    return try response_buffer.toOwnedSlice();
 }

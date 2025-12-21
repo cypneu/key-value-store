@@ -1,5 +1,6 @@
 const std = @import("std");
-const db = @import("../data_structures/mod.zig");
+const stream_store = @import("../stream.zig");
+const StreamFieldValue = stream_store.FieldValue;
 const types = @import("types.zig");
 const constants = @import("constants.zig");
 const lzf = @import("lzf.zig");
@@ -279,8 +280,8 @@ fn StreamLoader(comptime Loader: type) type {
             }
         }
 
-        fn readEntryFields(self: *Self, lp: *ListpackReader, use_master: bool, master_fields: []const []const u8) !std.ArrayList(db.StreamFieldValue) {
-            var fields = std.ArrayList(db.StreamFieldValue).init(self.allocator);
+        fn readEntryFields(self: *Self, lp: *ListpackReader, use_master: bool, master_fields: []const []const u8) !std.ArrayList(StreamFieldValue) {
+            var fields = std.ArrayList(StreamFieldValue).init(self.allocator);
             errdefer fields.deinit();
 
             if (use_master) {
@@ -415,10 +416,10 @@ const StringReader = struct {
     }
 
     fn readInteger(loader: anytype, encoding_type: u6) ![]u8 {
-        const val: u32 = switch (encoding_type) {
-            0 => try loader.readByte(),
-            1 => try loader.reader.readInt(u16, .little),
-            2 => try loader.reader.readInt(u32, .little),
+        const val: i64 = switch (encoding_type) {
+            0 => @as(i64, @as(i8, @bitCast(try loader.readByte()))),
+            1 => @as(i64, try loader.reader.readInt(i16, .little)),
+            2 => @as(i64, try loader.reader.readInt(i32, .little)),
             else => return types.RdbError.UnsupportedEncoding,
         };
         return try std.fmt.allocPrint(loader.allocator, "{d}", .{val});

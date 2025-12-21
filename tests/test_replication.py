@@ -1,4 +1,5 @@
 import socket
+import queue
 import threading
 import time
 from .utils import encode_command, read_reply, Connection, exec_command
@@ -463,8 +464,60 @@ def _wait_for_key(client, key, expected_val, timeout=2.0):
     start = time.time()
     while time.time() - start < timeout:
         client.sendall(encode_command("GET", key))
-        val = read_reply(client)
+        try:
+            val = read_reply(client)
+        except RuntimeError as e:
+            if "LOADING" in str(e):
+                time.sleep(0.05)
+                continue
+            raise
         if val == expected_val:
             return val
         time.sleep(0.05)
     return None
+
+
+def test_replica_blpop_unblocks_when_master_sends_rpush(cluster):
+    replica = cluster.replicas[0]
+
+    blpop_result = queue.Queue()
+
+    def blpop_on_replica():
+        try:
+            with socket.create_connection(("127.0.0.1", replica.port), timeout=5) as s:
+                s.sendall(encode_command("BLPOP", "testkey", "5"))
+                blpop_result.put(read_reply(s))
+        except Exception as e:
+            blpop_result.put(e)
+
+    t = threading.Thread(target=blpop_on_replica)
+    t.start()
+    time.sleep(0.1)
+
+    with cluster.master.client() as client:
+        client.sendall(encode_command("RPUSH", "testkey", "value1"))
+        assert read_reply(client) == 1
+
+    t.join(timeout=3)
+
+    assert not blpop_result.empty(), "BLPOP client did not receive a response"
+    result = blpop_result.get(timeout=1)
+    assert result == ["testkey", "value1"]
+
+
+def test_all_replicas_get_data_from_snapshot(server_factory):
+    master = server_factory()
+
+    with master.client() as client:
+        for i in range(50):
+            exec_command(client, "SET", f"shared_{i}", f"val_{i}")
+
+    replicas = []
+    for _ in range(3):
+        replica = server_factory(args=["--replicaof", f"{master.host} {master.port}"])
+        replicas.append(replica)
+
+    for idx, replica in enumerate(replicas):
+        with replica.client() as c:
+            val = _wait_for_key(c, "shared_49", "val_49", timeout=5.0)
+            assert val == "val_49", f"Replica {idx} missed data from snapshot"

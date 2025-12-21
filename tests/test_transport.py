@@ -1,5 +1,7 @@
 import time
 
+import pytest
+
 
 from .utils import encode_command, exec_command, read_reply, send_in_chunks
 
@@ -34,3 +36,10 @@ def test_large_bulk_string_requires_multiple_writes(master, make_key):
         s.sendall(encode_command("GET", key))
         time.sleep(0.2)
         assert read_reply(s, timeout=5.0) == value
+
+
+def test_protocol_error_closes_connection(master):
+    with master.client() as conn:
+        conn.sendall(b"x\r\n")
+        with pytest.raises((RuntimeError, ConnectionError)):
+            read_reply(conn, timeout=0.2)

@@ -1,14 +1,16 @@
 const std = @import("std");
-const db = @import("../data_structures/mod.zig");
 const types = @import("types.zig");
 const constants = @import("constants.zig");
+const StringStore = @import("../string.zig").StringStore;
+const ListStore = @import("../list.zig").ListStore;
+const StreamStore = @import("../stream.zig").StreamStore;
 
 pub const SnapshotPipe = struct {
     read_fd: std.posix.fd_t,
     child_pid: std.posix.pid_t,
 };
 
-pub fn forkSnapshotPipe(handler: anytype) !SnapshotPipe {
+pub fn forkSnapshotPipe(string_store: *StringStore, list_store: *ListStore, stream_store: *StreamStore) !SnapshotPipe {
     const fds = try std.posix.pipe();
     const read_fd = fds[0];
     const write_fd = fds[1];
@@ -21,7 +23,7 @@ pub fn forkSnapshotPipe(handler: anytype) !SnapshotPipe {
 
     if (pid == 0) {
         std.posix.close(read_fd);
-        childProcessLogic(write_fd, handler);
+        childProcessLogic(write_fd, string_store, list_store, stream_store);
         std.posix.exit(0);
     }
 
@@ -29,45 +31,35 @@ pub fn forkSnapshotPipe(handler: anytype) !SnapshotPipe {
     return .{ .read_fd = read_fd, .child_pid = pid };
 }
 
-fn childProcessLogic(fd: std.posix.fd_t, handler: anytype) void {
-    const child_alloc = std.heap.page_allocator;
-    const snapshot = generateSnapshot(child_alloc, handler) catch std.posix.exit(1);
-
-    var len_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &len_buf, @intCast(snapshot.len), .little);
-
-    writeAllFd(fd, &len_buf) catch std.posix.exit(1);
-    writeAllFd(fd, snapshot) catch std.posix.exit(1);
-
-    std.posix.close(fd);
+pub fn forkSnapshotPipeNonBlocking(string_store: *StringStore, list_store: *ListStore, stream_store: *StreamStore) !SnapshotPipe {
+    const pipe = try forkSnapshotPipe(string_store, list_store, stream_store);
+    const flags = try std.posix.fcntl(pipe.read_fd, std.posix.F.GETFL, 0);
+    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = try std.posix.fcntl(pipe.read_fd, std.posix.F.SETFL, flags | nonblock);
+    return pipe;
 }
 
-pub fn generateSnapshot(allocator: std.mem.Allocator, handler: anytype) ![]u8 {
+fn childProcessLogic(fd: std.posix.fd_t, string_store: *StringStore, list_store: *ListStore, stream_store: *StreamStore) void {
+    const file: std.fs.File = .{ .handle = fd };
+    const child_alloc = std.heap.page_allocator;
+    writeSnapshot(file.writer(), child_alloc, string_store, list_store, stream_store) catch std.posix.exit(1);
+    file.close();
+}
+
+pub fn generateSnapshot(allocator: std.mem.Allocator, string_store: *StringStore, list_store: *ListStore, stream_store: *StreamStore) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
-    try writeSnapshot(buf.writer(), allocator, handler);
+    try writeSnapshot(buf.writer(), allocator, string_store, list_store, stream_store);
     return buf.toOwnedSlice();
 }
 
-pub fn writeSnapshot(writer: anytype, allocator: std.mem.Allocator, handler: anytype) !void {
+pub fn writeSnapshot(writer: anytype, allocator: std.mem.Allocator, string_store: *StringStore, list_store: *ListStore, stream_store: *StreamStore) !void {
     var rdb_writer = RdbWriter(@TypeOf(writer)).init(writer);
     try rdb_writer.writeHeader();
-    try rdb_writer.writeStrings(allocator, handler.string_store);
-    try rdb_writer.writeLists(allocator, handler.list_store);
-    try rdb_writer.writeStreams(allocator, handler.stream_store);
+    try rdb_writer.writeStrings(allocator, string_store);
+    try rdb_writer.writeLists(allocator, list_store);
+    try rdb_writer.writeStreams(allocator, stream_store);
     try rdb_writer.writeEOF();
-}
-
-fn writeAllFd(fd: std.posix.fd_t, data: []const u8) !void {
-    var written: usize = 0;
-    while (written < data.len) {
-        const n = std.posix.write(fd, data[written..]) catch |err| {
-            if (err == error.Interrupted) continue;
-            return err;
-        };
-        if (n == 0) return error.DiskQuota;
-        written += n;
-    }
 }
 
 fn RdbWriter(comptime WriterType: type) type {
