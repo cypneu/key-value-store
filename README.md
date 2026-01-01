@@ -1,33 +1,119 @@
-[![progress-banner](https://backend.codecrafters.io/progress/redis/999a5979-8bc0-45a7-8e6e-1b47afb22ce0)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
+# Key-Value Store
 
-This is a starting point for Zig solutions to the
-["Build Your Own Redis" Challenge](https://codecrafters.io/challenges/redis).
+A **Redis-compatible in-memory key-value store** built from scratch in Zig. Features master-replica replication, transactions, streams, blocking commands, and RDB persistence.
 
-In this challenge, you'll build a toy Redis clone that's capable of handling
-basic commands like `PING`, `SET` and `GET`. Along the way we'll learn about
-event loops, the Redis protocol and more.
+> Built as a learning project following [CodeCrafters "Build Your Own Redis"](https://codecrafters.io/challenges/redis) challenge, then extended with additional features.
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
+## ✨ Features
 
-# Passing the first stage
+| Category | Features |
+|----------|----------|
+| **Data Types** | Strings, Lists, Streams |
+| **Persistence** | RDB snapshots (load & save) |
+| **Replication** | Master-replica with PSYNC, real-time propagation |
+| **Transactions** | MULTI/EXEC with command queuing |
+| **Blocking** | BLPOP, XREAD with timeouts |
+| **Protocol** | Full RESP2 implementation |
 
-The entry point for your Redis implementation is in `src/main.zig`. Study and
-uncomment the relevant code, and push your changes to pass the first stage:
+## 🧠 Data Structures
 
-```sh
-git commit -am "pass 1st stage" # any msg
-git push origin master
+Each store uses purpose-built data structures optimized for its access patterns:
+
+| Store | Data Structure | Complexity | Notes |
+|-------|---------------|------------|-------|
+| **StringStore** | `StringHashMap` | O(1) get/set | Lazy expiration - expired keys deleted on access |
+| **ListStore** | Ring-buffer Deque | O(1) push/pop | Circular buffer with dynamic resizing, O(r) range where r = result size |
+| **StreamStore** | Radix Tree | O(k) insert/lookup | Compressed trie keyed by 128-bit entry IDs, efficient range scans |
+
+## 🚀 Quick Start
+
+### Option 1: Native Zig (Linux only)
+
+**Prerequisites:** [Zig 0.14+](https://ziglang.org/download/)
+
+```bash
+# Build
+zig build
+
+# Run server (default port 6379)
+./zig-out/bin/main
+
+# Run with custom port
+./zig-out/bin/main --port 6380
+
+# Run as replica
+./zig-out/bin/main --port 6380 --replicaof "127.0.0.1 6379"
 ```
 
-That's all!
+### Option 2: Docker
 
-# Stage 2 & beyond
+```bash
+docker build -t zig-redis .
+docker run -it -v $(pwd):/app -p 6379:6379 zig-redis bash -c "zig build && ./zig-out/bin/main"
 
-Note: This section is for stages 2 and beyond.
+# Run as replica (connects to master on host machine)
+docker run -it -v $(pwd):/app -p 6380:6380 zig-redis bash -c "zig build && ./zig-out/bin/main --port 6380 --replicaof 'host.docker.internal 6379'"
+```
 
-1. Ensure you have `zig (0.14)` installed locally
-1. Run `./your_program.sh` to run your Redis server, which is implemented in
-   `src/main.zig`.
-1. Commit your changes and run `git push origin master` to submit your solution
-   to CodeCrafters. Test output will be streamed to your terminal.
+### Connect with redis-cli
+
+The server speaks the RESP2 protocol, so any standard Redis client works out of the box. The easiest way to test is with `redis-cli`:
+
+```bash
+# Install redis-cli (macOS)
+brew install redis
+
+# Connect to the running server
+redis-cli -p 6379
+
+127.0.0.1:6379> SET hello world
+OK
+127.0.0.1:6379> GET hello
+"world"
+127.0.0.1:6379> LPUSH mylist a b c
+(integer) 3
+127.0.0.1:6379> LRANGE mylist 0 -1
+1) "c"
+2) "b"
+3) "a"
+```
+
+## 📋 Supported Commands
+
+### Strings
+
+`SET`, `GET`, `INCR`, `TYPE`, `KEYS`, `ECHO`, `PING`
+
+### Lists
+
+`LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `BLPOP`
+
+### Streams
+
+`XADD`, `XRANGE`, `XREAD`, `XLEN`, `TYPE`
+
+### Server
+
+`INFO`, `CONFIG GET`, `SAVE`, `WAIT`
+
+### Transactions
+
+`MULTI`, `EXEC`, `DISCARD`
+
+### Replication
+
+`REPLCONF`, `PSYNC`
+
+## 📊 Benchmarks
+
+Compare throughput against reference Redis using `redis-benchmark`. The script spins up both servers in Docker containers and runs identical workloads:
+
+- Strings: SET/GET, INCR
+- Lists: LPUSH/LPOP/RPUSH, LRANGE
+- Streams: XADD, XRANGE, XREAD
+- Concurrency: 50 parallel clients
+- Pipelining: batches of 16 commands
+
+```bash
+./benchmarks/run.sh
+```

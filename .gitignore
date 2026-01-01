@@ -4,6 +4,9 @@ zig-cache/
 .zig-cache/
 zig-out/
 
+# Local snapshots
+*.rdb
+
 # Compiled binary output
 bin/
 !bin/.gitkeep

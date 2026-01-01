@@ -43,16 +43,17 @@ def test_rdb_load_few_large(server_factory):
         args=["--dir", str(ASSETS_DIR), "--dbfilename", "few_large.rdb"]
     )
 
-    with server.client() as s:
+    # Longer timeout for large RDB (5K stream entries + 10K list items + 1M string)
+    with server.client(timeout=10.0) as s:
         s.sendall(encode_command("GET", "large_str"))
-        val = read_reply(s)
+        val = read_reply(s, timeout=10.0)
         assert len(val) == 1_000_000
 
         s.sendall(encode_command("LLEN", "large_list"))
-        assert read_reply(s) == 10_000
+        assert read_reply(s, timeout=10.0) == 10_000
 
         s.sendall(encode_command("XRANGE", "large_stream", "-", "+"))
-        entries = read_reply(s)
+        entries = read_reply(s, timeout=10.0)
         assert len(entries) == 5000
 
 
